@@ -19,6 +19,18 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      - name: Fix patch literal replacement handling
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('.github/auth_hardening_patch.py')
+          s=p.read_text(encoding='utf-8')
+          old="s2, n = re.subn(pattern, repl, s, flags=re.S)"
+          new="s2, n = re.subn(pattern, lambda _m: repl, s, flags=re.S)"
+          if s.count(old) != 1:
+              raise SystemExit('expected replace_regex implementation not found exactly once')
+          p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
+          PY
       - name: Apply patch
         run: python .github/auth_hardening_patch.py
       - name: Test
