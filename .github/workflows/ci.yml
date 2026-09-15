@@ -1,31 +1,36 @@
-name: SPARK CI
+name: SPARK Auth Hardening
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+    branches:
+      - arch/0.0.1-direct-tunnel-auth
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  test:
-    name: Node ${{ matrix.node }} / ${{ matrix.os }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        node: [24]
-    runs-on: ${{ matrix.os }}
+  harden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
-          node-version: ${{ matrix.node }}
-      - name: Runtime versions
-        run: node --version
+          node-version: 24
+      - name: Apply patch
+        run: python .github/auth_hardening_patch.py
       - name: Test
         run: npm test
+      - name: Diff check
+        run: git diff --check
+      - name: Commit hardened source and restore normal CI
+        run: |
+          git show recovery/pre-0.0.1-auth-hardening-20260916:.github/workflows/ci.yml > .github/workflows/ci.yml
+          rm .github/auth_hardening_patch.py
+          git config user.name noname
+          git config user.email 118284176+spark000000@users.noreply.github.com
+          git add -A
+          git commit -m "Harden 0.0.1 per-instance authentication" -m "Require bearer auth at startup, persist the SPARK access key under private runtime secrets, bind tunnel reuse to tunnel/control-plane/SPARK-key identity, fix auth-aware tunnel readiness, verify missing/wrong/correct credentials, and document the verified per-user Plugin Connect flow."
+          git push origin HEAD:arch/0.0.1-direct-tunnel-auth
