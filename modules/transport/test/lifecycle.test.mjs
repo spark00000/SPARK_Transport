@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -27,6 +28,8 @@ test('Transport start/status/stop/restart', async (t) => {
     SPARK_ROOT: f.root,
     SPARK_PORT: String(port),
     SPARK_STATE_DIR: path.join(f.base, 'state'),
+    SPARK_MCP_AUTH_MODE: 'bearer',
+    SPARK_MCP_BEARER_TOKEN_SHA256: crypto.createHash('sha256').update('test-lifecycle-token').digest('hex'),
   };
   t.after(async () => {
     await run('stop', env).catch(() => {});
@@ -45,6 +48,16 @@ test('Transport start/status/stop/restart', async (t) => {
   assert.equal(result.code, 0, result.err);
   result = await run('stop', env);
   assert.equal(result.code, 0, result.err);
+});
+
+test('Transport refuses unauthenticated startup', async (t) => {
+  const f = await makeFixture();
+  const port = await freePort();
+  const env = { SPARK_ROOT:f.root, SPARK_PORT:String(port), SPARK_STATE_DIR:path.join(f.base,'state'), SPARK_MCP_AUTH_MODE:'none' };
+  t.after(async()=>{await f.cleanup();});
+  const result=await run('start',env);
+  assert.notEqual(result.code,0);
+  assert.match(result.err,/unauthenticated MCP access is forbidden|must be bearer/i);
 });
 
 test('Windows lifecycle scripts preserve help/init/start/restart/status/stop contract', async () => {
@@ -69,6 +82,11 @@ test('Windows lifecycle scripts preserve help/init/start/restart/status/stop con
   assert.match(init, /\$authCli generate --json/);
   assert.match(init, /refusing to overwrite/i);
   assert.match(init, /UTF8Encoding.*false/);
+  assert.match(init, /spark-access-key\.txt/);
+  assert.match(start, /auth:none is forbidden/i);
+  assert.match(start, /Test-TunnelReadyContent/);
+  assert.match(start, /controlPlaneKeySha256/);
+  assert.match(start, /sparkAccessKeySha256/);
   assert.match(start, /Get-StartApps/);
   assert.match(start, /modules\\transport\\config\\spark\.local\.json/);
   assert.match(start, /\.runtime\\config\\spark\.local\.json/);

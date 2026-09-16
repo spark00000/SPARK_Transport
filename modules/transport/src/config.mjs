@@ -96,16 +96,21 @@ function normalizeAllowedRoots(value) {
 
 function normalizeMcpAuth({ transport, env, overrides }) {
   const configured = transport.auth ?? {};
-  const requestedMode = overrides.authMode ?? env.SPARK_MCP_AUTH_MODE ?? configured.mode ?? 'none';
-  const mode = String(requestedMode).trim().toLowerCase();
-  if (!['none', 'bearer'].includes(mode)) throw new Error('transport.auth.mode must be none or bearer');
-  if (mode === 'none') return { mode: 'none', bearerTokenSha256: '' };
+  const requestedMode = overrides.authMode ?? env.SPARK_MCP_AUTH_MODE ?? configured.mode;
+  const mode = String(requestedMode ?? '').trim().toLowerCase();
+  if (mode !== 'bearer') {
+    throw new Error('transport.auth.mode must be bearer; unauthenticated MCP access is forbidden in SPARK 0.0.1');
+  }
 
   const rawHash = overrides.bearerTokenSha256 ?? env.SPARK_MCP_BEARER_TOKEN_SHA256 ?? configured.bearerTokenSha256;
   if (typeof rawHash !== 'string' || !/^[0-9a-f]{64}$/i.test(rawHash.trim())) {
     throw new Error('transport.auth.bearerTokenSha256 must be a 64-character SHA-256 hex digest when bearer auth is enabled');
   }
-  return { mode: 'bearer', bearerTokenSha256: rawHash.trim().toLowerCase() };
+  const accessKeyFile = overrides.accessKeyFile ?? env.SPARK_MCP_ACCESS_KEY_FILE ?? configured.accessKeyFile ?? '.runtime/secrets/spark-access-key.txt';
+  if (typeof accessKeyFile !== 'string' || accessKeyFile.trim() === '') {
+    throw new Error('transport.auth.accessKeyFile must be a non-empty path');
+  }
+  return { mode: 'bearer', bearerTokenSha256: rawHash.trim().toLowerCase(), accessKeyFile: accessKeyFile.trim() };
 }
 
 export function loadConfig(overrides = {}) {

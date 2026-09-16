@@ -341,47 +341,47 @@ Provider native mechanism이 persistent OS state를 필요로 하는 경우 그 
 
 예를 들어 Anthropic Sandbox Runtime의 Windows provider는 dedicated `srt-sandbox` account를 installation-scoped state로 유지하고, session ACE는 reset/process-exit 및 다음 initialize의 crash-recovery에서 정리하며, uninstall은 WFP filters, sandbox account, credential file, setup marker를 제거하는 lifecycle을 제공한다. SPARK가 유사한 provider를 채택할 경우에도 같은 종류의 deterministic lifecycle을 요구한다.
 
-### 10.7. 0.0.1 Intermediate Multi-user Deployment — Per-user Tunnel + Local Authorization
+### 10.7. 0.0.1 Multi-user Deployment — Shared Workspace App, Per-instance Tunnel/Auth
 
-0.0.1의 multi-user/deployment target은 **약 5명 규모의 독립 사용자/PC가 서로 간섭하지 않는 최소 배포 구조**다. 중앙 SPARK payload relay를 두지 않는다. 이 구조는 ChatGPT가 현재 local MCP server에 직접 연결하지 못하고 Secure MCP Tunnel 또는 remote MCP endpoint를 요구하는 provider 제약 때문에 선택하는 **intermediate architecture**이며, 장기적으로 Brain Host가 local MCP hosting을 지원하면 제거 가능한 계층으로 취급한다.
-
-Current ChatGPT path:
+Verified ChatGPT Business flow (2026-09-16):
 
 ```text
-User A ChatGPT app/connection
-  -> unique tunnel_A
-  -> OpenAI Secure MCP Tunnel
-  -> User A local SPARK
+Workspace admin/developer
+  -> create SPARK App
+  -> Connection = Tunnel
+  -> Authentication = Access token / API key
+  -> Header scheme = Bearer
+  -> Publish to Workspace
 
-User B ChatGPT app/connection
-  -> unique tunnel_B
-  -> OpenAI Secure MCP Tunnel
-  -> User B local SPARK
+Each user
+  -> ChatGPT Plugins -> SPARK -> Connect
+  -> "Enter access token or API key"
+  -> enter that local instance's spk_... key
+  -> ChatGPT sends Authorization: Bearer <spk_...>
+  -> Secure MCP Tunnel forwards Authorization
+  -> local SPARK validates SHA-256(token)
 ```
 
-Deployment invariants:
+The access key is **not entered in the App creation form**. It is entered by each user on the published Plugin's **Connect** screen. This live flow was followed by successful discovery of `Actions · 10` and the 10-tool SPARK surface in a new chat.
 
-- user/device/SPARK instance마다 distinct `tunnel_id`를 사용한다. 동일 tunnel을 서로 다른 local SPARK instance가 공유하지 않는다.
-- MCP app display name은 authorization identity가 아니다. 이름이 같거나 workspace에 app이 노출되어 있어도 다른 사용자의 local SPARK authority를 얻어서는 안 된다.
-- 각 local SPARK instance는 **instance-specific credential**을 검증한다. 0.0.1 source에는 `transport.auth.mode=bearer`와 `bearerTokenSha256` 기반 local MCP ingress 검증이 구현되었으며, raw token은 local config에 저장하지 않고 SHA-256 digest만 보관한다. `Authorization: Bearer <token>`이 없거나 digest가 일치하지 않으면 MCP path는 `401`로 fail closed한다. 0.0.1 tracked example config는 bearer mode와 fail-closed placeholder digest를 기본으로 하며, `SPARK init`이 실제 instance digest로 교체한다. Source-level `none` fallback은 legacy/development compatibility를 위해 남지만 public deployment는 bearer provisioning을 요구한다.
-- 0.0.1 인증은 중앙 OAuth/auth server 없이 **per-instance static bearer/access token(API key)** 을 사용한다. Credential은 instance마다 달라야 하고, local SPARK는 raw token이 아니라 SHA-256 digest만 저장하며, manual rotate/revoke를 지원한다. `no scheduled expiry`는 허용하지만 분실/노출 시 폐기할 수 없는 credential로 설계하지 않는다. Token은 외부 service나 human password가 아니라 Node.js built-in `crypto.randomBytes(32)`처럼 OS CSPRNG를 사용하는 256-bit random source에서 생성한다.
-- 사용자 입력 password는 기본 인증 방식으로 사용하지 않는다. 사람이 정한 password보다 installer가 생성한 high-entropy random token을 사용해 brute-force/재사용 위험을 줄인다.
-- OAuth/OIDC는 0.0.1 범위에서 구현하지 않는다. 팀/계정 lifecycle, self-service onboarding 또는 중앙 revocation 같은 요구가 실제로 생길 때 후속 버전에서 재검토한다.
-- local SPARK는 **자기 instance에 허용된 credential만** 승인한다. Workspace membership 또는 app visibility만으로 authorization하지 않는다.
-- 중앙 SPARK relay/router를 0.0.1 data plane에 두지 않는다. Filesystem data, command output, media/binary payload가 SPARK-operated cloud relay를 통과하지 않아야 한다.
-- 동일 PC의 다른 hostile local process가 loopback SPARK endpoint를 호출하거나 local credential을 탈취하는 문제는 별도 host-local threat model이며 **TBD**다. 0.0.1 multi-user isolation 범위에서는 remote/workspace user 간 cross-access 차단을 우선한다.
+Security invariant:
 
-Auth alternatives for 0.0.1:
+```text
+1 local SPARK instance
+= 1 tunnel_id
++ 1 Tunnel Runtime/control-plane key
++ 1 SPARK Access Key (spk_...)
+```
 
-| Method | Central always-on auth service | Runtime network dependency | 5-user 0.0.1 disposition |
-|---|---:|---:|---|
-| Per-instance bearer/access token/API key | No | None beyond Secure MCP Tunnel | **Selected for 0.0.1** |
-| Human password | No | None | Rejected as default; use generated high-entropy token instead |
-| OAuth/OIDC with hosted IdP | Yes for login/refresh | Depends on provider/token model | **Deferred beyond 0.0.1** |
-| Custom SSH-style public-key challenge | Would require custom protocol/client support | Depends on design | Deferred; current ChatGPT custom-app auth does not expose a generic SSH challenge flow |
-| Central SPARK payload relay | Yes | Every tool call | **Rejected for 0.0.1** |
-
-Claude Desktop provides a useful contrast: its Desktop Extensions can install and run local MCP servers directly on the user machine. If ChatGPT later provides an equivalent supported local-MCP hosting surface, SPARK SHOULD prefer that provider-native local path and remove the Secure MCP Tunnel/auth indirection where practical rather than preserving the intermediate topology for compatibility alone.
+- A tunnel ID is routing metadata, not sufficient authorization. Workspace members may be able to see/select other tunnels.
+- Tunnel Runtime key authenticates the local tunnel-client to OpenAI; SPARK Access Key authorizes MCP requests at the local SPARK boundary.
+- `transport.auth.mode=bearer` is mandatory. `auth:none` is rejected fail-closed.
+- Raw SPARK Access Key is private `.runtime/secrets/spark-access-key.txt`; config stores only its SHA-256 digest and path. Startup verifies raw-secret/digest consistency.
+- Runtime identity binds tunnel ID, control-plane-key SHA-256, SPARK-access-key SHA-256 and profile SHA-256; process reuse requires the same instance identity.
+- Missing/wrong `Authorization: Bearer ...` returns HTTP 401; matching key is required for tool access.
+- Workspace App definition may be shared; connection credential is entered per user at Plugins → SPARK → Connect.
+- OAuth/OIDC and a central payload relay remain deferred for the small-team 0.0.1 scope.
+- same-PC hostile-process isolation remains TBD.
 
 ### 10.8. File Content and Binary Transfer Semantics
 

@@ -1,73 +1,31 @@
-name: SPARK Auth Hardening
+name: SPARK CI
 
 on:
   push:
-    branches:
-      - arch/0.0.1-direct-tunnel-auth
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  harden:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  test:
+    name: Node ${{ matrix.node }} / ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [24]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
-      - name: Fix patch literal replacement handling
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('.github/auth_hardening_patch.py')
-          s=p.read_text(encoding='utf-8')
-          old="s2, n = re.subn(pattern, repl, s, flags=re.S)"
-          new="s2, n = re.subn(pattern, lambda _m: repl, s, flags=re.S)"
-          if s.count(old) != 1:
-              raise SystemExit('expected replace_regex implementation not found exactly once')
-          p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
-          PY
-      - name: Apply patch
-        run: python .github/auth_hardening_patch.py
-      - name: Align config tests with mandatory bearer auth
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('modules/transport/test/multi-root.test.mjs')
-          s=p.read_text(encoding='utf-8')
-          old="await fs.writeFile(configPath, JSON.stringify({ transport: { allowedRoot: [f.root, second] } }), 'utf8');"
-          new="await fs.writeFile(configPath, JSON.stringify({ transport: { allowedRoot: [f.root, second], auth: { mode: 'bearer', bearerTokenSha256: 'a'.repeat(64) } } }), 'utf8');"
-          if s.count(old)!=1: raise SystemExit('array fixture not found')
-          s=s.replace(old,new,1)
-          old="  ] } }), 'utf8');\n  const config = loadConfig({ configPath });"
-          new="  ], auth: { mode: 'bearer', bearerTokenSha256: 'a'.repeat(64) } } }), 'utf8');\n  const config = loadConfig({ configPath });"
-          if s.count(old)!=1: raise SystemExit('permission fixture not found')
-          s=s.replace(old,new,1)
-          s=s.replace("test('config normalizes optional MCP bearer authentication'", "test('config requires and normalizes MCP bearer authentication'",1)
-          old="assert.deepEqual(config.auth, { mode: 'bearer', bearerTokenSha256: digest });"
-          new="assert.deepEqual(config.auth, { mode: 'bearer', bearerTokenSha256: digest, accessKeyFile: '.runtime/secrets/spark-access-key.txt' });"
-          if s.count(old)!=1: raise SystemExit('auth expectation not found')
-          s=s.replace(old,new,1)
-          old="assert.deepEqual(loadConfig({ configPath: noAuthPath }).auth, { mode: 'none', bearerTokenSha256: '' });"
-          new="assert.throws(() => loadConfig({ configPath: noAuthPath }), /unauthenticated MCP access is forbidden|must be bearer/);"
-          if s.count(old)!=1: raise SystemExit('no-auth expectation not found')
-          s=s.replace(old,new,1)
-          p.write_text(s,encoding='utf-8',newline='\n')
-          PY
+          node-version: ${{ matrix.node }}
+      - name: Runtime versions
+        run: node --version
       - name: Test
         run: npm test
-      - name: Diff check
-        run: git diff --check
-      - name: Commit hardened source and restore normal CI
-        run: |
-          git show origin/recovery/pre-0.0.1-auth-hardening-20260916:.github/workflows/ci.yml > .github/workflows/ci.yml
-          rm .github/auth_hardening_patch.py
-          git config user.name noname
-          git config user.email 118284176+spark000000@users.noreply.github.com
-          git add -A
-          git commit -m "Harden 0.0.1 per-instance authentication" -m "Require bearer auth at startup, persist the SPARK access key under private runtime secrets, bind tunnel reuse to tunnel/control-plane/SPARK-key identity, fix auth-aware tunnel readiness, verify missing/wrong/correct credentials, and document the verified per-user Plugin Connect flow."
-          git push origin HEAD:arch/0.0.1-direct-tunnel-auth

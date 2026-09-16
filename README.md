@@ -128,7 +128,12 @@ node -p "require('./package.json').version"
 SPARK.cmd init
 ```
 
-`init`은 기존 `.runtime/config/spark.local.json`을 덮어쓰지 않습니다. 새 config를 만들면서 Node.js `crypto.randomBytes(32)` / OS CSPRNG로 256-bit per-instance SPARK Access Key를 생성하고, config에는 raw key가 아니라 SHA-256 digest만 저장합니다. 화면에 한 번 표시되는 `spk_...` key는 ChatGPT app connection에 입력할 값이므로 복사해 둡니다.
+`init`은 기존 private config나 기존 access-key secret을 덮어쓰지 않습니다. Node.js `crypto.randomBytes(32)` / OS CSPRNG로 256-bit per-instance SPARK Access Key를 만들고 다음 두 위치에 분리 저장합니다.
+
+- raw `spk_...` key: `.runtime/secrets/spark-access-key.txt`
+- SHA-256 digest: `.runtime/config/spark.local.json`의 `transport.auth.bearerTokenSha256`
+
+config의 `transport.auth.accessKeyFile`은 기본적으로 `.runtime/secrets/spark-access-key.txt`를 가리킵니다. `.runtime/` 전체는 Git에서 제외됩니다. 시작 시 SPARK는 secret file의 실제 key를 다시 SHA-256하여 config digest와 일치하는지 확인하고, 일치하지 않거나 auth가 `bearer`가 아니면 **startup을 fail closed**합니다.
 
 ```cmd
 notepad .runtime\config\spark.local.json
@@ -137,33 +142,13 @@ notepad .runtime\config\spark.local.json
 최소 수정 항목:
 
 - `transport.allowedRoot`: SPARK가 접근할 local root
-- `tunnel.id`: Step 1에서 준비한 **이 사용자/PC 전용** tunnel ID
-- `tunnel.controlPlaneApiKeyFile`: 기본값 `.runtime/secrets/control-plane-api-key.txt` 사용 권장
-- `chatgptUi.enabled`: ChatGPT UI/CDP 통합 사용 여부
-- `chatgptUi.theme`: 기본 `dark-red`
-- `chatgptUi.progress.enabled`: experimental progress overlay 사용 여부, 기본 `true`
+- `transport.auth.mode`: **반드시 `bearer`** (`none` 금지)
+- `transport.auth.accessKeyFile`: 기본 `.runtime/secrets/spark-access-key.txt`
+- `tunnel.id`: 이 사용자/PC 전용 Tunnel ID
+- `tunnel.controlPlaneApiKeyFile`: 기본 `.runtime/secrets/control-plane-api-key.txt`
+- `chatgptUi.enabled`, `chatgptUi.theme`, `chatgptUi.progress.enabled`
 
 Windows JSON path는 `C:/SPARK/...`처럼 `/` 표기를 권장합니다.
-
-Root별 권한 예:
-
-```json
-"allowedRoot": [
-  { "path": "C:/SPARK/workspace", "permissions": "RWX" },
-  { "path": "C:/SPARK/reference", "permissions": "R" }
-]
-```
-
-- `R`: list/read/copy source
-- `W`: create/write/modify/copy destination/move/delete
-- `X`: `run_command` cwd
-
-Private config 선택 순서:
-
-1. 명시적인 `-ConfigPath`
-2. 실제 파일이 존재하는 `SPARK_CONFIG`
-3. `modules/transport/config/spark.local.json`
-4. `.runtime/config/spark.local.json`
 
 ### Step 4 — Tunnel Runtime API key 저장
 
@@ -174,26 +159,16 @@ notepad .runtime\secrets\control-plane-api-key.txt
 
 파일에는 Step 1에서 만든 **OpenAI Tunnel Runtime API key 한 줄만** 저장합니다. `.runtime/`은 Git에 포함되지 않습니다.
 
-### Step 4A — 0.0.1 per-instance deployment notes
+### Step 4A — 0.0.1 instance identity / secret binding
 
-Access Key를 config 변경 없이 새로 생성/rotation하려면:
-
-```cmd
-SPARK.cmd auth generate
+```text
+1 local SPARK instance
+= 1 tunnel_id
++ 1 OpenAI Tunnel Runtime API key (control-plane key)
++ 1 SPARK Access Key (spk_...)
 ```
 
-각 user/device/SPARK instance는 서로 다른 다음 값을 사용합니다.
-
-- Secure MCP Tunnel ID
-- Tunnel Runtime API key
-- SPARK Access Key (`spk_...`)
-- private local config/runtime state
-
-ChatGPT custom app에서는 **Authentication = Access token / API key**, **Bearer** header scheme을 선택하고 Step 3에서 복사한 이 instance의 `spk_...` key를 입력합니다. 다른 instance key는 HTTP 401로 거부되어야 합니다. 0.0.1에는 중앙 SPARK OAuth service나 중앙 payload relay가 없습니다.
-
-Tracked example config 자체도 bearer mode + zero placeholder digest라 provisioning 전에는 fail closed합니다. Bearer mode의 local Windows validation은 raw key를 저장하지 않고 해당 process/session의 `SPARK_MCP_BEARER_TOKEN` environment variable로 전달할 수 있습니다.
-
-Experimental progress overlay는 measured SPARK watchdog progress와 heuristic Brain-working/elapsed state를 표시합니다. ChatGPT가 exact token/credit telemetry를 제공하지 않으면 `provider metrics unavailable`로 표시하며 추정 수치를 만들지 않습니다. `chatgptUi.progress.enabled=false`로 끌 수 있습니다.
+`tunnel_id`가 workspace UI에 보이더라도 `spk_...` key가 일치하지 않으면 local MCP는 HTTP 401로 거부합니다. SPARK runtime identity state에는 raw secret이 아니라 tunnel ID, tunnel Runtime key SHA-256, SPARK Access Key SHA-256, tunnel profile SHA-256을 기록하여 기존 tunnel process 재사용 시 동일 조합인지 확인합니다. `auth:none`은 0.0.1 runtime에서 허용하지 않습니다.
 
 ### Step 5 — SPARK 시작
 
@@ -225,27 +200,31 @@ SPARK.cmd validate
 
 모든 명령이 PASS해야 합니다.
 
-### Step 7 — ChatGPT custom MCP app 등록
+### Step 7 — ChatGPT workspace App publish + 사용자별 Access Key Connect
 
-SPARK runtime과 tunnel이 healthy/ready인 상태에서 ChatGPT에 등록합니다.
+**중요: SPARK Access Key는 App 생성 화면에 입력하는 것이 아닙니다.** 현재 ChatGPT Business UI에서 검증된 순서는 아래와 같습니다.
 
-1. ChatGPT에서 developer mode를 활성화합니다.
-2. Apps → Create에서 새 custom MCP app을 만듭니다.
-3. 이름은 **`SPARK`**로 지정합니다.
-4. 필요하면 app logo로 `docs/spark_icon1.png`를 사용합니다. 이 파일은 256×256 PNG이며 10 KB 미만입니다.
-5. Connection은 **`Tunnel`**을 선택합니다.
-6. Step 1에서 만든 tunnel을 선택하거나 `tunnel_id`를 붙여넣습니다.
-   - private/local MCP URL을 ChatGPT에 직접 입력하지 않습니다.
-7. `Scan Tools`를 실행하고 완료될 때까지 기다립니다.
-8. Actions가 정확히 **10개**인지 확인합니다.
-9. Create 후 app을 활성화합니다.
+#### A. Workspace admin/developer — App 정의 및 Publish
 
-Business에서 이미 publish된 custom app은 현재 직접 이름/metadata를 수정할 수 없습니다. 기존 `SPARK_Transport`를 `SPARK`로 바꾸려면 새 `SPARK` app을 recreate/publish한 뒤 기존 app을 **disable**합니다. UI에서 remove/delete가 제공되는 경우에만 제거하고, 없으면 disabled 상태로 둡니다. 개발자 모드의 미게시 app은 Manage에서 이름과 logo를 수정할 수 있습니다.
+1. ChatGPT developer mode를 활성화합니다.
+2. Apps/Create에서 custom App을 만들고 이름을 **`SPARK`**로 지정합니다.
+3. Connection은 **Tunnel**을 선택하고 이 SPARK instance의 `tunnel_id`를 선택/입력합니다.
+4. Authentication은 **`Access token / API key`** 를 선택합니다.
+5. Header scheme은 **`Bearer`** 를 선택합니다.
+6. App을 Workspace에 **Publish**합니다.
 
-OpenAI 공식 안내:
+#### B. 각 사용자 — Plugins 화면에서 자기 `spk_...` key 입력
 
-- Developer mode / custom MCP apps: https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt
-- Secure MCP Tunnel permission troubleshooting: https://github.com/openai/tunnel-client/blob/master/docs/permissions.md
+1. 사용자 ChatGPT에서 **Plugins → SPARK**를 엽니다.
+2. **Connect**를 누릅니다.
+3. 표시되는 **`Enter access token or API key`** 입력칸에 그 사용자의 local SPARK instance에 대응하는 `spk_...` 값을 입력합니다.
+   - `Bearer ` 문자열은 붙이지 않습니다.
+4. **Connect SPARK**를 누릅니다.
+5. App detail에서 **Actions · 10**이 표시되는지 확인합니다.
+6. Configure actions에서 Refresh가 필요하면 연결 완료 후 Refresh합니다. 연결되지 않은 상태에서는 `This app must be connected to refresh its actions.`가 표시될 수 있습니다.
+7. 새 Chat에서 SPARK tool 10개가 discovery되는지 확인합니다.
+
+즉 Workspace App 정의는 공유될 수 있지만 **connection credential은 각 사용자가 Plugins → SPARK → Connect 단계에서 따로 입력**합니다. 다른 팀원이 같은 `tunnel_id`를 볼 수 있어도 local SPARK의 per-instance `spk_...`가 없으면 요청은 401이어야 합니다.
 
 #### Create / Scan Tools가 실패할 때
 

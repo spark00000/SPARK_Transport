@@ -18,10 +18,17 @@ $base="http://$($config.transport.host):$($config.transport.port)$($config.trans
 $proto='2026-07-28'
 $id=100
 $authHeader=$null
-if($config.transport.auth -and [string]$config.transport.auth.mode -eq 'bearer'){
-  if(-not $env:SPARK_MCP_BEARER_TOKEN){Fail-Step 'S2V-01A' 'Bearer auth is enabled. Set SPARK_MCP_BEARER_TOKEN for this validation process.'}
-  $authHeader='Bearer '+$env:SPARK_MCP_BEARER_TOKEN
+if(-not $config.transport.auth -or [string]$config.transport.auth.mode -ne 'bearer'){Fail-Step 'S2V-01A' 'Bearer auth is required; auth:none is forbidden'}
+$accessToken=$env:SPARK_MCP_BEARER_TOKEN
+if(-not $accessToken){
+  $accessKeyFile=[string]$config.transport.auth.accessKeyFile
+  if(-not $accessKeyFile){$accessKeyFile='.runtime/secrets/spark-access-key.txt'}
+  if(-not [System.IO.Path]::IsPathRooted($accessKeyFile)){$accessKeyFile=Join-Path $root $accessKeyFile}
+  if(-not (Test-Path -LiteralPath $accessKeyFile -PathType Leaf)){Fail-Step 'S2V-01A' "SPARK access-key secret file not found: $accessKeyFile"}
+  $accessToken=(Get-Content -LiteralPath $accessKeyFile -Raw).Trim()
 }
+if(-not $accessToken){Fail-Step 'S2V-01A' 'SPARK access key is empty'}
+$authHeader='Bearer '+$accessToken
 
 function Call-Tool([string]$Name,[hashtable]$Arguments){
   $script:id++
@@ -37,6 +44,25 @@ function Assert-Ok($r,[string]$Id,[string]$Name){
 }
 
 Write-Host "[S2V-01] PASS - Config/MCP endpoint: $base"
+$probeBody=@{jsonrpc='2.0';id=99;method='tools/list';params=@{_meta=@{'io.modelcontextprotocol/protocolVersion'=$proto;'io.modelcontextprotocol/clientCapabilities'=@{};'io.modelcontextprotocol/clientInfo'=@{name='spark-auth-validator';version='1'}}}}|ConvertTo-Json -Depth 10 -Compress
+$probeHeaders=@{'MCP-Protocol-Version'=$proto;'Mcp-Method'='tools/list'}
+function Get-ProbeStatus([hashtable]$Headers){
+  try{return [int](Invoke-WebRequest -UseBasicParsing -Method Post -Uri $base -Headers $Headers -ContentType 'application/json' -Body $probeBody -TimeoutSec 15).StatusCode}catch{
+    if($_.Exception.Response){return [int]$_.Exception.Response.StatusCode}
+    throw
+  }
+}
+$noAuthStatus=Get-ProbeStatus $probeHeaders
+if($noAuthStatus -ne 401){Fail-Step 'S2V-01B' "missing Authorization was not rejected; status=$noAuthStatus"}
+Write-Host '[S2V-01B] PASS - missing Authorization rejected with HTTP 401'
+$wrongHeaders=@{}+$probeHeaders;$wrongHeaders['Authorization']='Bearer spk_wrong_key'
+$wrongStatus=Get-ProbeStatus $wrongHeaders
+if($wrongStatus -ne 401){Fail-Step 'S2V-01C' "wrong Authorization was not rejected; status=$wrongStatus"}
+Write-Host '[S2V-01C] PASS - wrong Authorization rejected with HTTP 401'
+$correctHeaders=@{}+$probeHeaders;$correctHeaders['Authorization']=$authHeader
+$correctStatus=Get-ProbeStatus $correctHeaders
+if($correctStatus -ne 200){Fail-Step 'S2V-01D' "correct Authorization did not succeed; status=$correctStatus"}
+Write-Host '[S2V-01D] PASS - configured SPARK access key accepted'
 $tag='spark-transport-'+[DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')
 $dir=$tag
 $file="$dir\sample.txt"

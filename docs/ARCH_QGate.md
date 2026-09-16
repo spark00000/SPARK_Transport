@@ -36,7 +36,10 @@
 | PowerShell parser gate | PASS — start/stop/init/bootstrap/validator/ChatGPT UI scripts |
 | integrated 0.0.1 runtime stop/start + Transport/Tunnel/ChatGPT UI recovery | PASS — live runtime restored and SPARK tools/UI watcher remained usable |
 | Windows live `SPARK.cmd validate` after restart onto active 0.0.1 source | PASS — CRUD/write/modify/copy/move/run_command/traversal rejection/Recycle Bin file+directory completed on the live runtime |
-| ChatGPT `Access token / API key` own-key success / foreign-key denial | **PENDING final multi-user gate** |
+| ChatGPT published Plugin user-connect credential UI | PASS — Plugins → SPARK → Connect exposes `Enter access token or API key`; per-user `spk_...` entry verified |
+| ChatGPT action discovery after Connect | PASS — App detail shows `Actions · 10`; new chat exposes 10 SPARK tools |
+| `auth:none` production startup prohibition | PASS — source/config gate added; live restart acceptance pending |
+| ChatGPT own-key success / missing-key + foreign-key denial with local bearer enforcement enabled | **PENDING final multi-user gate** |
 | Ubuntu Node 24 CI on usage-overlay code head `f8a9972` | PASS — run `35020324238` |
 | Windows Node 24 CI on usage-overlay code head `f8a9972` | PASS — run `35020324238` |
 | ProcessService filesystem/network confinement outside FileService roots | **TBD / KNOWN GAP** — current `X` gates cwd only; child authority remains ambient OS-user authority |
@@ -58,7 +61,8 @@ Candidate acceptance requires all of the following before the final `v0.0.1` tag
 - watchdog regressions prove tool/request/lifecycle control returns within declared bounds.
 - experimental progress UI renders on the real ChatGPT Windows DOM and remains removable/recoverable.
 - after runtime restart, Windows `SPARK.cmd validate` PASS on the 0.0.1 source.
-- ChatGPT custom app configured as `Access token / API key` + Bearer succeeds with its own SPARK instance key and fails with another instance key.
+- published ChatGPT Plugin is connected per user through Plugins → SPARK → Connect → `Enter access token or API key`.
+- local runtime refuses `auth:none`; missing/wrong bearer returns 401; the connected user's matching key succeeds.
 - GitHub Actions Ubuntu Node 24 PASS.
 - GitHub Actions Windows Node 24 PASS.
 
@@ -70,13 +74,13 @@ Exact candidate SHA, CI run IDs and final live runtime acceptance belong in loca
 - **DEBT-002 / TBD:** `run_command` cwd containment is not an OS filesystem/network sandbox. If a root grants `X`, the launched process may access other locations allowed by the ambient OS account. FileService R/W and Recycle Bin semantics do not constrain arbitrary child-process I/O. Provider-native ProcessService confinement remains deferred.
 - **DEBT-003 / RESEARCH:** Cygwin remains only a possible Windows POSIX/ACL File/Permission PAL helper; it is not a ProcessService sandbox.
 - **DEBT-004 / TBD:** same-PC hostile local-process isolation remains deferred; 0.0.1 prioritizes remote/workspace-user cross-access prevention.
-- **DEPLOY-001:** 0.0.1 uses one distinct Secure MCP Tunnel and one high-entropy bearer credential per SPARK instance. It intentionally has no SPARK-operated central payload relay or OAuth service.
+- **DEPLOY-001:** 0.0.1 binds one local instance to one tunnel ID + one Tunnel Runtime/control-plane key + one high-entropy SPARK bearer credential. Tunnel visibility/routing alone never authorizes local MCP access. It intentionally has no SPARK-operated central payload relay or OAuth service.
 - **DEPLOY-002:** the raw per-instance access key is an initial connection secret. Normal SPARK config stores only its SHA-256 digest. Manual generation/rotation remains possible with `SPARK auth generate`.
 - **UX-001 / EXPERIMENTAL:** Brain working indication is a ChatGPT DOM heuristic and may require adaptation when the provider UI changes. SPARK watchdog progress is measured locally. ChatGPT quota telemetry currently reuses the provider's authenticated internal `/wham/usage` client/query and therefore may break when the desktop app changes; it must fail soft and never fabricate quota values. The usage integration is UX-only and is not part of the Agent Core or authorization boundary.
 - **PROCESS-001:** Independent Architecture Peer review has not been executed in this authoring context.
 
 ## 3. Gate Conclusion
 
-**0.0.1 source-level release-candidate gate: PASS locally; cross-platform CI, integrated runtime recovery, and live Windows `SPARK.cmd validate` are PASS. The only remaining release blocker is the user-scoped ChatGPT Bearer own-key/wrong-key E2E.**
+**0.0.1 source-level release-candidate gate: user-scoped ChatGPT Connect UI and 10-action discovery are verified. The remaining release blocker is live enforcement after hardening: auth:none startup must fail, missing/wrong key must return 401, and the connected user's matching key must succeed.**
 
 This is **not yet the final 0.0.1 baseline** and does not authorize creating/moving `v0.0.1` until that Bearer E2E passes. ProcessService filesystem/network confinement and same-PC hostile-process isolation remain explicit deferred gaps rather than implied guarantees.

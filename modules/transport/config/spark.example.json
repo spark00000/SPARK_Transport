@@ -23,6 +23,7 @@
     "recycleBin": true,
     "auth": {
       "mode": "bearer",
+      "accessKeyFile": ".runtime/secrets/spark-access-key.txt",
       "bearerTokenSha256": "0000000000000000000000000000000000000000000000000000000000000000"
     }
   },

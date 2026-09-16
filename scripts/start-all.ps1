@@ -14,6 +14,18 @@ function Resolve-RepoRelative([string]$Value){
   return Join-Path $root $Value
 }
 
+function Get-TextSha256([string]$Value){
+  $sha=[System.Security.Cryptography.SHA256]::Create()
+  try{
+    $bytes=[System.Text.Encoding]::UTF8.GetBytes($Value)
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
+  }finally{$sha.Dispose()}
+}
+
+function Test-TunnelReadyContent([string]$Content){
+  return ([string]$Content).Trim() -match '^ready(?:$|\s|\()'
+}
+
 function Start-NormalChatGPTApp(){
   $running=Get-Process -Name 'ChatGPT' -ErrorAction SilentlyContinue
   if($running){Write-Host '[S2-10] PASS - ChatGPT already running';return}
@@ -114,6 +126,19 @@ $env:SPARK_CONFIG=$ConfigPath
 try{$config=Get-Content -Raw $ConfigPath | ConvertFrom-Json}catch{Fail-Step 'S2-01' "invalid JSON in local config: $($_.Exception.Message)"}
 Write-Host "[S2-01] PASS - Config loaded: $ConfigPath"
 
+if(-not $config.transport.auth -or [string]$config.transport.auth.mode -ne 'bearer'){Fail-Step 'S2-01A' 'transport.auth.mode must be bearer; auth:none is forbidden in SPARK 0.0.1'}
+$configuredSparkDigest=[string]$config.transport.auth.bearerTokenSha256
+if($configuredSparkDigest -notmatch '^[0-9a-fA-F]{64}$'){Fail-Step 'S2-01A' 'transport.auth.bearerTokenSha256 must be a 64-character SHA-256 digest'}
+$accessKeyFile=[string]$config.transport.auth.accessKeyFile
+if(-not $accessKeyFile){$accessKeyFile='.runtime/secrets/spark-access-key.txt'}
+$accessKeyPath=Resolve-RepoRelative $accessKeyFile
+if(-not (Test-Path -LiteralPath $accessKeyPath -PathType Leaf)){Fail-Step 'S2-01A' "SPARK access-key secret file not found: $accessKeyPath"}
+$accessKeyValue=(Get-Content -LiteralPath $accessKeyPath -Raw).Trim()
+if(-not $accessKeyValue){Fail-Step 'S2-01A' "SPARK access-key secret file is empty: $accessKeyPath"}
+$sparkAccessKeySha256=Get-TextSha256 $accessKeyValue
+if($sparkAccessKeySha256 -ne $configuredSparkDigest.ToLowerInvariant()){Fail-Step 'S2-01A' 'SPARK access-key secret does not match transport.auth.bearerTokenSha256'}
+Write-Host "[S2-01A] PASS - Bearer auth required; SPARK access key verified: $accessKeyPath (value hidden)"
+
 Write-Host '[S2-02] Checking Node.js...'
 & node --version
 if($LASTEXITCODE -ne 0){Fail-Step 'S2-02' 'Node.js 20+ is required'}
@@ -164,6 +189,7 @@ if(-not (Test-Path $keyPath)){Fail-Step 'S2-05' "Tunnel key file not found: $key
 $keyPath=(Resolve-Path $keyPath).Path
 $keyValue=(Get-Content -Raw $keyPath).Trim()
 if(-not $keyValue){Fail-Step 'S2-05' "Tunnel key file is empty: $keyPath"}
+$controlPlaneKeySha256=Get-TextSha256 $keyValue
 $keyRef="file:$keyPath"
 Write-Host "[S2-05] PASS - Tunnel key file: $keyPath (value hidden)"
 
@@ -238,7 +264,7 @@ if(Test-Path -LiteralPath $existingTunnelPidFile -PathType Leaf){
 $listenerReady=$false
 try{
   $ready=Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 'http://127.0.0.1:8080/readyz'
-  $listenerReady=($ready.Content.Trim() -eq 'ready')
+  $listenerReady=(Test-TunnelReadyContent $ready.Content)
 }catch{}
 if($listenerReady -and -not $existingTunnelOwned){Fail-Step 'S2-07' 'Port 8080 reports ready but is not owned by the SPARK tunnel PID file; refusing to reuse an unknown listener'}
 
@@ -253,6 +279,8 @@ if($listenerReady -and $existingTunnelOwned -and $runtimeState -and $profileTunn
   $runtimeIdentityOk=(
     [int]$runtimeState.pid -eq $existingTunnelPid -and
     [string]$runtimeState.tunnelId -eq [string]$config.tunnel.id -and
+    [string]$runtimeState.controlPlaneKeySha256 -eq [string]$controlPlaneKeySha256 -and
+    [string]$runtimeState.sparkAccessKeySha256 -eq [string]$sparkAccessKeySha256 -and
     [string]$runtimeState.profilePath -ieq [string]$profilePath -and
     [string]$runtimeState.profileSha256 -eq [string]$profileHash -and
     [string]$profileTunnelId -eq [string]$config.tunnel.id
@@ -305,7 +333,7 @@ Write-Host "[S2-07] PASS - tunnel profile ready for $profileTunnelId"
 
 try{
   $ready=Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 'http://127.0.0.1:8080/readyz'
-  if($ready.Content.Trim() -eq 'ready'){Fail-Step 'S2-08' 'Port 8080 is still ready after stale/unverified SPARK tunnel cleanup; refusing to start another tunnel-client'}
+  if(Test-TunnelReadyContent $ready.Content){Fail-Step 'S2-08' 'Port 8080 is still ready after stale/unverified SPARK tunnel cleanup; refusing to start another tunnel-client'}
 }catch{
   if($_.Exception.Message.StartsWith('[S2-08]')){throw}
 }
@@ -330,6 +358,8 @@ $profileHash=Get-TunnelProfileHash $profilePath
 $runtimeState=[ordered]@{
   pid=$proc.Id
   tunnelId=[string]$config.tunnel.id
+  controlPlaneKeySha256=[string]$controlPlaneKeySha256
+  sparkAccessKeySha256=[string]$sparkAccessKeySha256
   profile=[string]$profile
   profilePath=[string]$profilePath
   profileSha256=[string]$profileHash
@@ -350,7 +380,7 @@ do{
   }
   try{
     $ready=Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 'http://127.0.0.1:8080/readyz'
-    if($ready.Content.Trim() -eq 'ready' -and (Test-TunnelControlPlanePoll)){
+    if(Test-TunnelReadyContent $ready.Content -and (Test-TunnelControlPlanePoll)){
       Write-Host "[S2-09] PASS - tunnel ready + Control Plane poll OK (PID $($proc.Id), tunnelId=$($config.tunnel.id))"
       Start-ChatGPTExperience
       Write-Host '[S2-11] PASS - Startup complete.'
