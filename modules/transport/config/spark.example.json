@@ -16,12 +16,23 @@
     "healthPath": "/health",
     "maxReadBytes": 1048576,
     "commandTimeoutMs": 30000,
+    "operationTimeoutMs": 30000,
+    "httpRequestTimeoutMs": 15000,
+    "serverCloseTimeoutMs": 3000,
     "stateDir": ".runtime",
-    "recycleBin": true
+    "recycleBin": true,
+    "auth": {
+      "mode": "bearer",
+      "accessKeyFile": ".runtime/secrets/spark-access-key.txt",
+      "bearerTokenSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
   },
   "chatgptUi": {
     "enabled": true,
-    "theme": "dark-red"
+    "theme": "dark-red",
+    "progress": {
+      "enabled": true
+    }
   },
   "tunnel": {
     "enabled": true,

@@ -49,6 +49,17 @@ test('timeout terminates child process tree',async(t)=>{
   const r=await runProcess({command:process.execPath,args:['-e',parentScript],cwd:dir,timeoutMs:250,maxOutputBytes:4096});
   assert.equal(r.ok,false);
   assert.equal(r.error.code,'COMMAND_TIMEOUT');
+  assert.ok(r.durationMs<5000,`timeout result exceeded hard cleanup bound: ${r.durationMs}ms`);
   await new Promise(resolve=>setTimeout(resolve,1200));
   await assert.rejects(()=>fs.access(marker),error=>error?.code==='ENOENT');
+});
+
+test('parent exit does not wait forever for descendant-inherited stdio',async()=>{
+  const childScript='setTimeout(()=>process.exit(0),1500);';
+  const parentScript=`const{spawn}=require('child_process');const c=spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{detached:true,stdio:['ignore','inherit','inherit']});c.unref();`;
+  const started=Date.now();
+  const r=await runProcess({command:process.execPath,args:['-e',parentScript],cwd:os.tmpdir(),timeoutMs:5000,maxOutputBytes:4096});
+  const elapsed=Date.now()-started;
+  assert.equal(r.ok,true);
+  assert.ok(elapsed<1200,`parent result waited on descendant-held stdio for ${elapsed}ms`);
 });

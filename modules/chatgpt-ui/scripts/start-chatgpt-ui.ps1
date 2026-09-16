@@ -9,6 +9,10 @@ param(
 
     [string]$NodePath = '',
 
+    [string]$TransportHealthUrl = 'http://127.0.0.1:8765/health',
+
+    [switch]$DisableProgress,
+
     [switch]$ValidateOnly
 )
 
@@ -347,15 +351,21 @@ try {
     }
     Write-Host "[UI-04] PASS - Theme applied and verified: $Theme"
 
-    $watcher = Start-Process -FilePath $NodePath -ArgumentList @(
+    $watcherArguments = @(
         $WatcherPath,
         '--host', '127.0.0.1',
         '--port', $port,
         '--theme', $ThemePath,
         '--interval', 1500,
         '--unavailable-exit', 30000
-    ) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $RuntimeDirectory 'watcher-out.log') -RedirectStandardError (Join-Path $RuntimeDirectory 'watcher-error.log')
+    )
+    if(-not $DisableProgress){
+        $watcherArguments += @('--transport-health', $TransportHealthUrl)
+    }
+    $watcher = Start-Process -FilePath $NodePath -ArgumentList $watcherArguments -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $RuntimeDirectory 'watcher-out.log') -RedirectStandardError (Join-Path $RuntimeDirectory 'watcher-error.log')
     $active['watcherPid'] = $watcher.Id
+    $active['progressEnabled'] = (-not $DisableProgress)
+    if(-not $DisableProgress){$active['transportHealthUrl'] = $TransportHealthUrl}
     Write-JsonFile -Path $ActivePath -Value $active
     Write-Host "[UI-05] PASS - UI watcher started, PID=$($watcher.Id)"
 

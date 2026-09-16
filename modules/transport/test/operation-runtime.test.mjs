@@ -36,6 +36,27 @@ test('operation runtime normalizes success and persists ledger',async(t)=>{
   assert.equal(recent[1].operation,'create_file');
 });
 
+test('operation activity exposes bounded metadata without target or arguments',async()=>{
+  let release;
+  const gate=new Promise((resolve)=>{release=resolve;});
+  const ledger={nextOperationId:()=> 'op-activity',record:async(entry)=>entry};
+  const toolRuntime={call:async()=>{await gate;return{ok:true,path:'secret.txt',text:'x'};}};
+  const runtime=createOperationRuntime({toolRuntime,ledger,operationTimeoutMs:1000,ledgerTimeoutMs:100});
+  const pending=runtime.call('read_file',{path:'secret.txt'});
+  await new Promise((resolve)=>setTimeout(resolve,10));
+  const active=runtime.activity();
+  assert.equal(active.active.operationId,'op-activity');
+  assert.equal(active.active.operation,'read_file');
+  assert.equal(active.active.watchdogMs,1000);
+  assert.equal(Object.hasOwn(active.active,'path'),false);
+  release();
+  await pending;
+  const done=runtime.activity();
+  assert.equal(done.active,null);
+  assert.equal(done.last.operation,'read_file');
+  assert.equal(done.last.status,'success');
+});
+
 test('operation runtime makes permission failure explicit',async(t)=>{
   const stateDir=await fs.mkdtemp(path.join(os.tmpdir(),'spark-ledger-'));
   t.after(()=>fs.rm(stateDir,{recursive:true,force:true}));
@@ -50,4 +71,49 @@ test('operation runtime makes permission failure explicit',async(t)=>{
   const [entry]=await ledger.recent(1);
   assert.equal(entry.status,'failed');
   assert.equal(entry.errorCode,'ELEVATION_REQUIRED_OR_PERMISSION_DENIED');
+});
+
+test('operation watchdog bounds a hung read-only tool call',async()=>{
+  const records=[];
+  const ledger={nextOperationId:()=> 'op-read-watchdog',record:async(entry)=>{records.push(entry);return entry;}};
+  const toolRuntime={call:async()=>new Promise(()=>{})};
+  const runtime=createOperationRuntime({toolRuntime,ledger,operationTimeoutMs:50,ledgerTimeoutMs:50});
+  const started=Date.now();
+  const result=await runtime.call('read_file',{path:'hung.txt'});
+  assert.equal(result.ok,false);
+  assert.equal(result.error.code,'OPERATION_TIMEOUT');
+  assert.equal(result.retryable,true);
+  assert.equal(result.data.stateUncertain,false);
+  assert.ok(Date.now()-started<500);
+  assert.equal(records.length,1);
+});
+
+test('operation watchdog marks timed-out mutations uncertain and blocks overlapping mutation',async()=>{
+  let seq=0;
+  const ledger={nextOperationId:()=> `op-write-watchdog-${++seq}`,record:async(entry)=>entry};
+  const toolRuntime={call:async()=>new Promise(()=>{})};
+  const runtime=createOperationRuntime({toolRuntime,ledger,operationTimeoutMs:50,ledgerTimeoutMs:50});
+  const result=await runtime.call('create_file',{path:'hung.txt'});
+  assert.equal(result.ok,false);
+  assert.equal(result.error.code,'OPERATION_TIMEOUT');
+  assert.equal(result.retryable,false);
+  assert.equal(result.data.stateUncertain,true);
+  assert.equal(result.data.pendingOperationId,'op-write-watchdog-1');
+  const blocked=await runtime.call('write_file',{path:'other.txt',text:'x'});
+  assert.equal(blocked.ok,false);
+  assert.equal(blocked.error.code,'UNCERTAIN_MUTATION_IN_FLIGHT');
+  assert.equal(blocked.retryable,false);
+  assert.equal(blocked.data.stateUncertain,true);
+  assert.equal(blocked.data.pendingOperationId,'op-write-watchdog-1');
+});
+
+test('operation result is not blocked forever by a hung ledger write',async()=>{
+  const ledger={nextOperationId:()=> 'op-ledger-watchdog',record:async()=>new Promise(()=>{})};
+  const toolRuntime={call:async()=>({ok:true,path:'a.txt',text:'x'})};
+  const runtime=createOperationRuntime({toolRuntime,ledger,operationTimeoutMs:100,ledgerTimeoutMs:50});
+  const started=Date.now();
+  const result=await runtime.call('read_file',{path:'a.txt'});
+  assert.equal(result.ok,true);
+  assert.match(result.data.ledgerWarning,/watchdog/);
+  assert.ok(Date.now()-started<500);
 });

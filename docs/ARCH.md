@@ -1,6 +1,6 @@
 # ARCH — SPARK (Symbiotic Personal AI Robotic Keeper)
 
-**Version:** 0.0.0
+**Version:** 0.0.1
 **Status:** Accepted Architecture Baseline
 **Architecture review:** 2026-09-12 / 1.23
 
@@ -341,6 +341,112 @@ Provider native mechanism이 persistent OS state를 필요로 하는 경우 그 
 
 예를 들어 Anthropic Sandbox Runtime의 Windows provider는 dedicated `srt-sandbox` account를 installation-scoped state로 유지하고, session ACE는 reset/process-exit 및 다음 initialize의 crash-recovery에서 정리하며, uninstall은 WFP filters, sandbox account, credential file, setup marker를 제거하는 lifecycle을 제공한다. SPARK가 유사한 provider를 채택할 경우에도 같은 종류의 deterministic lifecycle을 요구한다.
 
+### 10.7. 0.0.1 Multi-user Deployment — Shared Workspace App, Per-instance Tunnel/Auth
+
+Verified ChatGPT Business flow (2026-09-16):
+
+```text
+Workspace admin/developer
+  -> create SPARK App
+  -> Connection = Tunnel
+  -> Authentication = Access token / API key
+  -> Header scheme = Bearer
+  -> Publish to Workspace
+
+Each user
+  -> ChatGPT Plugins -> SPARK -> Connect
+  -> "Enter access token or API key"
+  -> enter that local instance's spk_... key
+  -> ChatGPT sends Authorization: Bearer <spk_...>
+  -> Secure MCP Tunnel forwards Authorization
+  -> local SPARK validates SHA-256(token)
+```
+
+The access key is **not entered in the App creation form**. It is entered by each user on the published Plugin's **Connect** screen. This live flow was followed by successful discovery of `Actions · 10` and the 10-tool SPARK surface in a new chat.
+
+Security invariant:
+
+```text
+1 local SPARK instance
+= 1 tunnel_id
++ 1 Tunnel Runtime/control-plane key
++ 1 SPARK Access Key (spk_...)
+```
+
+- A tunnel ID is routing metadata, not sufficient authorization. Workspace members may be able to see/select other tunnels.
+- Tunnel Runtime key authenticates the local tunnel-client to OpenAI; SPARK Access Key authorizes MCP requests at the local SPARK boundary.
+- `transport.auth.mode=bearer` is mandatory. `auth:none` is rejected fail-closed.
+- Raw SPARK Access Key is private `.runtime/secrets/spark-access-key.txt`; config stores only its SHA-256 digest and path. Startup verifies raw-secret/digest consistency.
+- Runtime identity binds tunnel ID, control-plane-key SHA-256, SPARK-access-key SHA-256 and profile SHA-256; process reuse requires the same instance identity.
+- Missing/wrong `Authorization: Bearer ...` returns HTTP 401; matching key is required for tool access.
+- Workspace App definition may be shared; connection credential is entered per user at Plugins → SPARK → Connect.
+- OAuth/OIDC and a central payload relay remain deferred for the small-team 0.0.1 scope.
+- same-PC hostile-process isolation remains TBD.
+
+### 10.8. File Content and Binary Transfer Semantics
+
+Current `read_file` is intentionally a **UTF-8 text operation**, not a generic byte-transfer operation. It enforces the configured read-size limit and performs fatal UTF-8 decoding. A file that cannot be decoded as UTF-8 is rejected as unsupported encoding.
+
+SPARK does not define "text versus binary" by filename extension or by a heuristic scan. Filesystems store bytes; some arbitrary binary byte sequences may also happen to be valid UTF-8. Therefore the operation semantics are explicit:
+
+```text
+read_file/get_text  -> caller requests UTF-8 text semantics
+get_file/get_blob   -> future explicit byte/file-transfer semantics
+```
+
+Consequences:
+
+- JSON containing numbers that represent byte values is still text if the JSON file itself is valid UTF-8; it is not reclassified as binary because its content describes bytes.
+- A nominally binary file whose raw bytes happen to form valid UTF-8 may be returned by a text operation. MIME type/extension are advisory metadata, not a proof of binary-ness.
+- A future arbitrary-file download feature must be a separate tool/resource contract rather than weakening `read_file` into silent base64 fallback.
+- MCP supports image/audio content and binary `BlobResourceContents` encoded as base64, plus `resource_link` references. Base64 adds material transfer overhead, so large binary transfer requires explicit size limits and should prefer a client-supported resource/download path when available.
+- Under the current ChatGPT Secure MCP Tunnel architecture, bytes returned from a local SPARK MCP tool still traverse the OpenAI tunnel path. SPARK therefore must not assume that a local file download is zero-cost or direct merely because the source file is local.
+
+0.0.1 does not add unrestricted binary transfer merely to make every local file downloadable. A future file-transfer capability requires an explicit size/streaming/download design and acceptance test on the actual Brain Host client.
+
+### 10.9. Timeout, Watchdog, Reconciliation and Progress Semantics
+
+All user-facing synchronous waits must be bounded. `run_command` keeps its default 30-second command timeout and may accept an explicit positive `timeoutMs`. The process runner does not wait indefinitely for Node's child `close` event: after process exit it allows a short bounded output-drain grace, and Windows timeout cleanup bounds the `taskkill /T /F` helper itself before returning. This closes the failure mode where a descendant-held stdio handle caused a nominal `COMMAND_TIMEOUT` to remain blocked for hours.
+
+A final operation watchdog also wraps every MCP tool invocation. The default non-command operation watchdog is 30 seconds. `run_command` receives its requested/default command timeout plus a bounded cleanup grace. HTTP request receive time and server shutdown are independently bounded, as are Recycle Bin helper execution, bootstrap downloads, validation HTTP calls, test cases and CI jobs.
+
+Timeout does **not** mean rollback. A command such as `git clone`, compiler/package install, file copy or arbitrary script can have partial side effects before it is killed. Therefore timeout/failure semantics distinguish confirmed completion from uncertain state:
+
+```text
+operation timeout / command timeout
+  -> stop or bound the controllable execution path
+  -> return explicit timeout/failure
+  -> stateUncertain=true when mutation may already have occurred
+  -> do not blindly retry
+  -> inspect/reconcile filesystem, process and/or Git state
+  -> only then retry with a larger timeout or choose cleanup
+```
+
+If a mutating FileService operation exceeds the generic operation watchdog while its underlying promise has not settled, SPARK records it as a **pending uncertain mutation** and fail-closes subsequent mutations with `UNCERTAIN_MUTATION_IN_FLIGHT`. Read-only inspection remains available for reconciliation. The pending guard clears only when the underlying operation actually settles; if it never settles, operator recovery/restart is required rather than overlapping another mutation.
+
+A user-facing "continue this same command?" interaction still cannot preserve the same process with the current synchronous `run_command` contract. ChatGPT cannot ask a new question until the pending MCP call returns. After timeout, a larger-timeout execution is a **new process**, not continuation, and must follow reconciliation first.
+
+True long-running continuation/progress remains a deferred managed ProcessService lifecycle:
+
+```text
+start_process
+process_status
+process_output
+stop_process
+```
+
+That design can return a process handle immediately, expose output/status incrementally, ask the user whether to continue, and explicitly stop the managed process when requested. SPARK SHALL NOT emulate continuation by merely timing out the HTTP response while intentionally leaving an unmanaged child running.
+
+OpenAI Secure MCP Tunnel independently bounds MCP transport connection lifetime (currently default 10 minutes) and supports forwarded MCP progress notifications. That transport TTL is an upper transport bound, not SPARK's operation watchdog. Current SPARK JSON-only HTTP MCP does not yet stream in-flight MCP progress notifications.
+
+Operational UX rule for AI-driven SPARK work: multi-stage work SHOULD emit visible `Step n/m` milestone reports before and after meaningful stages or potentially blocking tool calls. A true periodic heartbeat cannot be emitted while one blocking MCP call has control; the Agent must not invent background progress and must report the actual elapsed/result immediately when control returns.
+
+0.0.1 adds an **experimental local progress/usage projection** in `modules/chatgpt-ui`. The watcher polls the loopback Transport health endpoint and injects compact telemetry into unused ChatGPT sidebar regions instead of covering the conversation surface. `SPARK` progress is determinate because it uses local `startedAt/watchdogMs`; Brain progress is only an indeterminate working/elapsed heuristic derived from visible provider UI controls.
+
+For provider usage, the 0.0.1 Windows integration was verified against ChatGPT Desktop's already-loaded authenticated client and its background `rate-limit-status` source. That source performs authenticated `GET /wham/usage` polling and exposes primary/secondary windows (`used_percent`, `limit_window_seconds`, `reset_at`). SPARK does not scrape the visible Usage popup: when the compatible internal client is discoverable, the watcher reads the same provider data without opening the popup, calculates remaining percentage as `100 - used_percent`, and displays the five-hour and weekly windows with reset time/date. The live acceptance observation was `5H 100%` and `WK 76%`, matching the provider Usage popup shown separately by the user. Provider usage is cached for 30 seconds and refreshed fail-soft; if the internal client/API contract is unavailable after a ChatGPT update, the UI falls back to non-authoritative local/model/chat telemetry rather than fabricating quota values.
+
+The progress panels are collision-aware. The top panel is dynamically constrained between the current-mode control and the Search control so Search/activity controls remain visible. The bottom panel is dynamically constrained between the Workspace control and the Update control; the Voice area may be intentionally covered, but Update remains visible. This overlay is UX telemetry only, not an execution or authorization boundary, and it can be disabled with `chatgptUi.progress.enabled=false`.
+
 ## 11. Recoverable Delete
 
 Core semantics:
@@ -434,9 +540,9 @@ Root `scripts/`는 SPARK 전체 lifecycle orchestration(`start-all/status-all/st
 - **codex-chatgpt-web** — bridge가 자체 parallel permission sandbox를 발명하지 않고 outer Codex execution/sandbox authority를 재사용하는 delegation pattern reference.
 - **Jan** — future provider-neutral/local-model client and UI reference.
 
-## 16. 0.0.0 Implemented Scope
+## 16. Implemented Scope
 
-Implemented:
+### 16.1. Inherited 0.0.0 baseline
 
 - 10 MCP tools: read/list/CRUD/delete/run_command
 - recovery backup + SHA-256
@@ -448,6 +554,20 @@ Implemented:
 - private default state directory
 - lifecycle/status
 - Windows + Linux CI
+
+### 16.2. 0.0.1 multi-user / deployment release-candidate additions
+
+- per-instance `Authorization: Bearer` validation with only SHA-256 token digest stored locally
+- `SPARK auth generate` using Node.js `crypto.randomBytes(32)` / OS CSPRNG for a 256-bit access key
+- `SPARK init` first-use provisioning that refuses to overwrite an existing private config and prints the raw access key only for initial connection setup
+- fail-closed example config with bearer auth enabled and a non-working placeholder digest until first-use provisioning replaces it
+- distinct per-user/device Secure MCP Tunnel + per-instance access-key deployment model with no SPARK-operated central payload relay
+- bounded command/tool/request/lifecycle watchdogs plus `stateUncertain` reconciliation semantics after timed-out mutations
+- experimental ChatGPT UI progress/usage strip: Brain working/elapsed heuristic, exact SPARK watchdog progress, popup-free provider usage telemetry from the authenticated ChatGPT Desktop `GET /wham/usage` source when compatible, and fail-soft fallback when that provider contract is unavailable
+- collision-aware sidebar placement that keeps Search/activity and Update visible while using otherwise unused sidebar header/footer space
+- PowerShell web-request progress rendering suppressed during tunnel readiness polling to avoid the blinking `Reading web response` console UI while preserving the polling/watchdog behavior
+- `SPARK.cmd restart` no longer depends on a self-recursive batch `call`/`:restart` label path; restart directly executes bounded stop then start lifecycle scripts
+- ChatGPT UI runtime JSON reader tolerates the Windows PowerShell UTF-8 BOM used by existing runtime files
 
 Architecture-only / deferred:
 
@@ -487,8 +607,16 @@ Architecture-only / deferred:
 | ADR-022 | Container/VM 같은 heavyweight isolation은 default dependency로 도입하지 않으며, practical native enforcement가 없으면 capability를 과장하지 않고 security gap을 명시 |
 | ADR-023 | Current `run_command`의 `X`는 cwd authorization만 의미한다. child process의 filesystem/network confinement은 provider-native PAL 구현이 검증될 때까지 TBD이며, `R`-only 및 unconfigured paths는 ProcessService boundary로 보호된다고 주장하지 않음 |
 | ADR-024 | Cygwin은 Windows File/Permission PAL을 단순화할 수 있는 POSIX/ACL helper 후보로만 연구하며, ProcessService sandbox 또는 filesystem security boundary로 취급하지 않음 |
+| ADR-025 | 0.0.1 intermediate multi-user deployment는 user/device/SPARK instance별 distinct Secure MCP Tunnel + local instance authorization을 사용하고 중앙 SPARK payload relay를 두지 않음 |
+| ADR-026 | 약 5명 규모의 0.0.1에서는 per-instance high-entropy bearer/access token을 최소 인증 방식으로 채택한다. Local SPARK는 raw token 대신 SHA-256 digest를 저장하고 `Authorization: Bearer`를 fail-closed 검증한다. OAuth/OIDC는 account lifecycle이 필요할 때 선택적으로 사용 |
+| ADR-027 | text/binary 구분은 heuristic이 아니라 operation contract로 정의한다. `read_file`은 strict UTF-8 text이며 arbitrary binary/file download는 별도 bounded MCP resource/blob/download capability로 설계 |
+| ADR-028 | 0.0.1 multi-user 인증은 중앙 OAuth/relay 없이 per-instance high-entropy static bearer/API key를 사용하고, OAuth/OIDC와 same-PC hostile-process isolation은 후속 scope로 defer |
+| ADR-029 | 모든 synchronous MCP operation은 bounded watchdog을 갖는다. `run_command`는 process exit/stdio drain/tree-kill까지 bounded하며, timed-out mutation은 `stateUncertain`로 처리하고 reconciliation 전 blind retry를 금지한다. 아직 settle되지 않은 timed-out mutation이 있으면 후속 mutation을 fail-closed로 차단한다. 동일 process의 진짜 continue/streaming progress는 managed asynchronous ProcessService로만 구현한다 |
 
-## 18. 0.0.0 Verification Status
+| ADR-030 | 0.0.1 per-instance SPARK access keys SHALL be generated from 32 CSPRNG bytes (`crypto.randomBytes(32)` / OS entropy), encoded with the `spk_` prefix, and stored by SPARK only as a SHA-256 digest. Human-chosen passwords are not the 0.0.1 default. |
+| ADR-031 | Experimental ChatGPT UI progress SHALL distinguish measured SPARK watchdog progress from heuristic Brain-working indication. Provider usage may be shown only from a trustworthy provider value; the verified 0.0.1 ChatGPT Desktop integration reuses the authenticated background `/wham/usage` source without opening the Usage popup and fails soft to local/model/chat telemetry if that internal contract is unavailable. SPARK SHALL NOT fabricate reasoning percentages, token counts, credit consumption, or quota values. |
+
+## 18. Verification Status
 
 0.0.0 baseline acceptance는 다음 검증을 포함한다.
 
@@ -501,6 +629,21 @@ Architecture-only / deferred:
 - GitHub Actions Node 24 matrix의 Ubuntu/Windows jobs PASS.
 
 Public baseline은 위 gate를 통과한 **single root commit**을 `v0.0.0`으로 tag한다. Independent Architecture Peer review는 별도 process gate이며 이 문서의 author self-check와 동일시하지 않는다.
+
+### 18.2. 0.0.1 release-candidate gate
+
+0.0.1 source promotion is valid only when the following remain true:
+
+- package/runtime/launcher version agree on `0.0.1`.
+- per-instance bearer authorization positive/negative regression passes.
+- `SPARK auth generate` and `SPARK init` use 256-bit OS-CSPRNG material and do not persist the raw access key.
+- new-install example config is fail closed with bearer mode enabled until provisioning replaces the placeholder digest.
+- watchdog/reconciliation regressions pass and no known synchronous SPARK-owned wait is unbounded.
+- ChatGPT UI theme validation passes and the experimental progress/usage overlay renders on the real ChatGPT Windows DOM without covering required Search/Update controls.
+- popup-free provider usage telemetry, when available, matches the provider Usage popup for the same session and is sourced from the authenticated ChatGPT Desktop `/wham/usage` background data rather than fabricated estimates. If that internal contract is unavailable, quota display must fail soft rather than invent values.
+- tracked-source hygiene excludes `_pArc/`, `.runtime/`, nested `.SPARK.wiki`, private config, and secrets.
+- Windows + Linux CI pass on the candidate commit.
+- **Pending final live gate:** after restarting onto the 0.0.1 source, one ChatGPT custom-app connection using `Access token / API key` + Bearer must succeed with its own key and fail with a different instance key. Until that user-scoped E2E passes, do not create/move the `v0.0.1` final tag.
 
 ## 19. External References
 
@@ -515,11 +658,15 @@ Project process/verification records are local-only under `_pArc/` (`SWE1.md`, `
 - codex-chatgpt-web: https://github.com/miuuyy/codex-chatgpt-web
 - Cygwin User's Guide / filesystem and ACL behavior: https://cygwin.com/cygwin-ug-net/using.html
 - Cygwin `setfacl`: https://cygwin.com/cygwin-ug-net/setfacl.html
+- OpenAI ChatGPT Developer Mode / MCP Apps: https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt
+- OpenAI Secure MCP Tunnel client: https://github.com/openai/tunnel-client
+- MCP tool/resource binary content: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+- Claude Desktop local MCP / Desktop Extensions: https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop
 - Jan: https://github.com/janhq/jan
 
 ## Baseline Handoff
 
-`0.0.0`은 현재 기능을 정리한 verified **private-use baseline**이다. 이 baseline에는 Transport 10-tool, Secure MCP Tunnel, one-click lifecycle, integrated ChatGPT UI, multi-root/RWX policy와 local-only runtime separation이 포함된다. 다음 `0.0.1`은 multi-user usage와 installation/deployment hardening을 별도 범위로 진행한다.
+`0.0.0`은 inherited verified **private-use baseline**이다. 이 baseline에는 Transport 10-tool, Secure MCP Tunnel, one-click lifecycle, integrated ChatGPT UI, multi-root/RWX policy와 local-only runtime separation이 포함된다. 현재 tracked source는 `0.0.1` multi-user/deployment release candidate이며 per-instance Bearer authorization, 256-bit access-key provisioning, bounded watchdog/reconciliation, sidebar progress/usage telemetry와 deployment hardening을 추가했다. Final `v0.0.1` 승격은 ChatGPT custom-app `Access token / API key` + Bearer own-key success / wrong-key denial live E2E가 끝난 뒤에만 수행한다.
 
 ## 20. Architecture Reference Study
 
@@ -1106,6 +1253,10 @@ SPARK.cmd start
   -> theme reload watcher
 ```
 
-The theme feature inside ChatGPT UI is not an MCP tool and does not change the 10-tool MCP contract. The `chatgpt-ui` module belongs to the Client / UX Plane and Windows runtime integration and is the extension point for future font-size, wrapping and usage-display controls. `chatgptUi.enabled=false` falls back to the normal ChatGPT Windows app launch path. `status` reports ChatGPT UI watcher/CDP health separately, and `stop` terminates the ChatGPT UI watcher before stopping ChatGPT.
+The theme feature inside ChatGPT UI is not an MCP tool and does not change the 10-tool MCP contract. The `chatgpt-ui` module belongs to the Client / UX Plane and Windows runtime integration and is the extension point for font-size, wrapping, progress and usage-display controls. `chatgptUi.enabled=false` falls back to the normal ChatGPT Windows app launch path. `status` reports ChatGPT UI watcher/CDP health separately, and `stop` terminates the ChatGPT UI watcher before stopping ChatGPT.
+
+0.0.1 extends this runtime with a compact sidebar progress/usage projection. The top panel is positioned dynamically between the ChatGPT mode control and Search so required header controls remain visible. The lower panel is positioned between Workspace and Update; it may occupy the Voice area but preserves Update. SPARK operation progress comes from Transport `/health` bounded activity metadata, Brain working state is a DOM heuristic, and provider quota uses ChatGPT Desktop's authenticated background `/wham/usage` data when compatible. Verified live values were `5H 100%` and `WK 76%` with the same reset values shown by the provider Usage popup. Provider quota polling is cached/fail-soft and is treated as a brittle provider integration rather than a stable Core contract; if it breaks after a ChatGPT update, the UI falls back without fabricating usage.
+
+The Windows lifecycle also suppresses PowerShell web-request progress rendering during tunnel readiness polling so `Reading web response` does not blink in the console, while preserving the actual readiness checks and watchdogs. `SPARK.cmd restart` directly performs stop then start instead of depending on a recursive batch label dispatch.
 
 ChatGPT UI module은 원래 MIT license를 `modules/chatgpt-ui/LICENSE`에 유지한다. ChatGPT UI runtime state는 `modules/chatgpt-ui/.runtime/`에 저장하며 Git에서 제외한다.

@@ -1,5 +1,8 @@
 import { spawn } from 'node:child_process';
 
+const WINDOWS_KILLER_TIMEOUT_MS = 3_000;
+const EXIT_DRAIN_GRACE_MS = 250;
+
 function createBoundedCapture(maxBytes) {
   const chunks = [];
   let bytes = 0;
@@ -23,25 +26,42 @@ function createBoundedCapture(maxBytes) {
   };
 }
 
-async function terminateProcessTree(pid, child) {
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export async function terminateProcessTree(pid, child) {
   if (!pid) {
     try { child?.kill('SIGKILL'); } catch {}
     return;
   }
+
   if (process.platform === 'win32') {
     await new Promise((resolve) => {
       let killer;
+      let settled = false;
+      let timer;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
       try {
         killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
           stdio: 'ignore',
           windowsHide: true,
         });
       } catch {
-        resolve();
+        finish();
         return;
       }
-      killer.once('error', () => resolve());
-      killer.once('close', () => resolve());
+      killer.once('error', finish);
+      killer.once('close', finish);
+      timer = setTimeout(() => {
+        try { killer?.kill('SIGKILL'); } catch {}
+        finish();
+      }, WINDOWS_KILLER_TIMEOUT_MS);
     });
     try { child?.kill('SIGKILL'); } catch {}
     return;
@@ -49,7 +69,7 @@ async function terminateProcessTree(pid, child) {
 
   try { process.kill(-pid, 'SIGTERM'); }
   catch { try { child?.kill('SIGTERM'); } catch {} }
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await delay(150);
   try { process.kill(-pid, 'SIGKILL'); }
   catch { try { child?.kill('SIGKILL'); } catch {} }
 }
@@ -61,6 +81,9 @@ export async function runProcess({ command, args = [], cwd, timeoutMs, maxOutput
   if (!Array.isArray(args) || !args.every((v) => typeof v === 'string')) {
     return { ok: false, error: { code: 'INVALID_ARGUMENTS', message: 'args must be an array of strings' } };
   }
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    return { ok: false, error: { code: 'INVALID_ARGUMENTS', message: 'timeoutMs must be a positive integer' } };
+  }
   if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0) {
     return { ok: false, error: { code: 'INVALID_ARGUMENTS', message: 'maxOutputBytes must be a positive integer' } };
   }
@@ -70,12 +93,16 @@ export async function runProcess({ command, args = [], cwd, timeoutMs, maxOutput
     let settled = false;
     let timedOut = false;
     let child;
+    let timeoutTimer;
+    let exitDrainTimer;
     const stdoutCapture = createBoundedCapture(maxOutputBytes);
     const stderrCapture = createBoundedCapture(maxOutputBytes);
 
     const finish = (payload) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(exitDrainTimer);
       const stdout = stdoutCapture.result();
       const stderr = stderrCapture.result();
       resolve({
@@ -85,6 +112,29 @@ export async function runProcess({ command, args = [], cwd, timeoutMs, maxOutput
         stdoutTruncated: stdout.truncated,
         stderrTruncated: stderr.truncated,
         durationMs: Date.now() - startedAt,
+      });
+    };
+
+    const finishFromExit = (code, signal) => {
+      if (timedOut) {
+        finish({
+          ok: false,
+          error: { code: 'COMMAND_TIMEOUT', message: `command exceeded ${timeoutMs} ms timeout` },
+          exitCode: code,
+          signal,
+        });
+        return;
+      }
+      finish({
+        ok: code === 0,
+        exitCode: code,
+        signal,
+        ...(code === 0 ? {} : {
+          error: {
+            code: 'COMMAND_FAILED',
+            message: 'command exited with non-zero status; elevated execution is not attempted automatically',
+          },
+        }),
       });
     };
 
@@ -112,7 +162,10 @@ export async function runProcess({ command, args = [], cwd, timeoutMs, maxOutput
     child.stderr?.on('data', (d) => stderrCapture.push(d));
 
     child.once('error', (error) => {
-      clearTimeout(timer);
+      if (timedOut) {
+        finishFromExit(child?.exitCode ?? null, child?.signalCode ?? null);
+        return;
+      }
       const permission = error?.code === 'EACCES' || error?.code === 'EPERM';
       finish({
         ok: false,
@@ -123,34 +176,31 @@ export async function runProcess({ command, args = [], cwd, timeoutMs, maxOutput
       });
     });
 
-    child.once('close', (code, signal) => {
-      clearTimeout(timer);
-      if (timedOut) {
-        finish({
-          ok: false,
-          error: { code: 'COMMAND_TIMEOUT', message: `command exceeded ${timeoutMs} ms timeout` },
-          exitCode: code,
-          signal,
-        });
-        return;
-      }
-      finish({
-        ok: code === 0,
-        exitCode: code,
-        signal,
-        ...(code === 0 ? {} : {
-          error: {
-            code: 'COMMAND_FAILED',
-            message: 'command exited with non-zero status; elevated execution is not attempted automatically',
-          },
-        }),
-      });
+    child.once('exit', (code, signal) => {
+      if (settled) return;
+      exitDrainTimer = setTimeout(() => {
+        try { child.stdout?.destroy(); } catch {}
+        try { child.stderr?.destroy(); } catch {}
+        finishFromExit(code, signal);
+      }, EXIT_DRAIN_GRACE_MS);
     });
 
-    const timer = setTimeout(() => {
+    child.once('close', (code, signal) => {
+      finishFromExit(code, signal);
+    });
+
+    timeoutTimer = setTimeout(() => {
+      if (settled) return;
       timedOut = true;
-      void terminateProcessTree(child.pid, child);
+      void (async () => {
+        await terminateProcessTree(child.pid, child);
+        await delay(EXIT_DRAIN_GRACE_MS);
+        if (!settled) {
+          try { child.stdout?.destroy(); } catch {}
+          try { child.stderr?.destroy(); } catch {}
+          finishFromExit(child.exitCode ?? null, child.signalCode ?? null);
+        }
+      })();
     }, timeoutMs);
-    timer.unref?.();
   });
 }

@@ -17,12 +17,25 @@ try{$config=Get-Content -Raw $ConfigPath | ConvertFrom-Json}catch{Fail-Step 'S2V
 $base="http://$($config.transport.host):$($config.transport.port)$($config.transport.mcpPath)"
 $proto='2026-07-28'
 $id=100
+$authHeader=$null
+if(-not $config.transport.auth -or [string]$config.transport.auth.mode -ne 'bearer'){Fail-Step 'S2V-01A' 'Bearer auth is required; auth:none is forbidden'}
+$accessToken=$env:SPARK_MCP_BEARER_TOKEN
+if(-not $accessToken){
+  $accessKeyFile=[string]$config.transport.auth.accessKeyFile
+  if(-not $accessKeyFile){$accessKeyFile='.runtime/secrets/spark-access-key.txt'}
+  if(-not [System.IO.Path]::IsPathRooted($accessKeyFile)){$accessKeyFile=Join-Path $root $accessKeyFile}
+  if(-not (Test-Path -LiteralPath $accessKeyFile -PathType Leaf)){Fail-Step 'S2V-01A' "SPARK access-key secret file not found: $accessKeyFile"}
+  $accessToken=(Get-Content -LiteralPath $accessKeyFile -Raw).Trim()
+}
+if(-not $accessToken){Fail-Step 'S2V-01A' 'SPARK access key is empty'}
+$authHeader='Bearer '+$accessToken
 
 function Call-Tool([string]$Name,[hashtable]$Arguments){
   $script:id++
   $body=@{jsonrpc='2.0';id=$script:id;method='tools/call';params=@{name=$Name;arguments=$Arguments;_meta=@{'io.modelcontextprotocol/protocolVersion'=$proto;'io.modelcontextprotocol/clientCapabilities'=@{};'io.modelcontextprotocol/clientInfo'=@{name='spark-transport-validator';version='1'}}}}|ConvertTo-Json -Depth 12 -Compress
   $h=@{'MCP-Protocol-Version'=$proto;'Mcp-Method'='tools/call';'Mcp-Name'=$Name}
-  try{return (Invoke-RestMethod -Method Post -Uri $base -Headers $h -ContentType 'application/json' -Body $body).result.structuredContent}catch{Fail-Step 'S2V-MCP' "$Name request failed: $($_.Exception.Message)"}
+  if($authHeader){$h['Authorization']=$authHeader}
+  try{return (Invoke-RestMethod -Method Post -Uri $base -Headers $h -ContentType 'application/json' -Body $body -TimeoutSec 15).result.structuredContent}catch{Fail-Step 'S2V-MCP' "$Name request failed or exceeded 15 second watchdog: $($_.Exception.Message)"}
 }
 
 function Assert-Ok($r,[string]$Id,[string]$Name){
@@ -31,6 +44,25 @@ function Assert-Ok($r,[string]$Id,[string]$Name){
 }
 
 Write-Host "[S2V-01] PASS - Config/MCP endpoint: $base"
+$probeBody=@{jsonrpc='2.0';id=99;method='tools/list';params=@{_meta=@{'io.modelcontextprotocol/protocolVersion'=$proto;'io.modelcontextprotocol/clientCapabilities'=@{};'io.modelcontextprotocol/clientInfo'=@{name='spark-auth-validator';version='1'}}}}|ConvertTo-Json -Depth 10 -Compress
+$probeHeaders=@{'MCP-Protocol-Version'=$proto;'Mcp-Method'='tools/list'}
+function Get-ProbeStatus([hashtable]$Headers){
+  try{return [int](Invoke-WebRequest -UseBasicParsing -Method Post -Uri $base -Headers $Headers -ContentType 'application/json' -Body $probeBody -TimeoutSec 15).StatusCode}catch{
+    if($_.Exception.Response){return [int]$_.Exception.Response.StatusCode}
+    throw
+  }
+}
+$noAuthStatus=Get-ProbeStatus $probeHeaders
+if($noAuthStatus -ne 401){Fail-Step 'S2V-01B' "missing Authorization was not rejected; status=$noAuthStatus"}
+Write-Host '[S2V-01B] PASS - missing Authorization rejected with HTTP 401'
+$wrongHeaders=@{}+$probeHeaders;$wrongHeaders['Authorization']='Bearer spk_wrong_key'
+$wrongStatus=Get-ProbeStatus $wrongHeaders
+if($wrongStatus -ne 401){Fail-Step 'S2V-01C' "wrong Authorization was not rejected; status=$wrongStatus"}
+Write-Host '[S2V-01C] PASS - wrong Authorization rejected with HTTP 401'
+$correctHeaders=@{}+$probeHeaders;$correctHeaders['Authorization']=$authHeader
+$correctStatus=Get-ProbeStatus $correctHeaders
+if($correctStatus -ne 200){Fail-Step 'S2V-01D' "correct Authorization did not succeed; status=$correctStatus"}
+Write-Host '[S2V-01D] PASS - configured SPARK access key accepted'
 $tag='spark-transport-'+[DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff')
 $dir=$tag
 $file="$dir\sample.txt"

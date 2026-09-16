@@ -3,6 +3,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { evaluate, listTargets, waitForTargets } from "./cdp.mjs";
+import { buildProgressRestoreExpression } from "./progress.mjs";
 import {
   DEFAULT_THEME_PATH,
   PROJECT_ROOT,
@@ -85,7 +86,8 @@ function parseArgs(argv) {
 
 async function readJsonIfPresent(filePath) {
   try {
-    return JSON.parse(await readFile(filePath, "utf8"));
+    const source = await readFile(filePath, "utf8");
+    return JSON.parse(source.replace(/^\uFEFF/, ""));
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
@@ -195,8 +197,9 @@ async function run(command, options) {
   }
 
   if (command === "restore") {
+    const progressRestored = await evaluateTargets(targets, buildProgressRestoreExpression(), options);
     await rm(options.statePath, { force: true });
-    return { command, restored: results };
+    return { command, restored: results, progressRestored };
   }
 
   return {

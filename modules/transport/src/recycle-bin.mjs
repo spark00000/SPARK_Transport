@@ -1,8 +1,10 @@
-import { spawn } from 'node:child_process';
+import { runProcess } from './command-runner.mjs';
+
+const DEFAULT_RECYCLE_BIN_TIMEOUT_MS = 30_000;
 
 function psQuote(value) { return `'${String(value).replaceAll("'", "''")}'`; }
 
-export async function moveToRecycleBin(absolutePath, isDirectory) {
+export async function moveToRecycleBin(absolutePath, isDirectory, { timeoutMs = DEFAULT_RECYCLE_BIN_TIMEOUT_MS } = {}) {
   if (process.platform !== 'win32') {
     const error = new Error('Recycle Bin delete is supported only on Windows in Sprint-2');
     error.code = 'RECYCLE_BIN_UNAVAILABLE';
@@ -14,18 +16,15 @@ export async function moveToRecycleBin(absolutePath, isDirectory) {
     `$p=${psQuote(absolutePath)}`,
     `[Microsoft.VisualBasic.FileIO.FileSystem]::${method}($p, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)`,
   ].join('; ');
-  await new Promise((resolve, reject) => {
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], { windowsHide: true });
-    let stderr = '';
-    child.stderr.on('data', (d) => { stderr += d; });
-    child.on('error', reject);
-    child.on('exit', (code) => {
-      if (code === 0) resolve();
-      else {
-        const error = new Error(stderr.trim() || `Recycle Bin operation failed with exit code ${code}`);
-        error.code = 'RECYCLE_BIN_FAILED';
-        reject(error);
-      }
-    });
+  const result = await runProcess({
+    command: 'powershell.exe',
+    args: ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    cwd: process.cwd(),
+    timeoutMs,
+    maxOutputBytes: 8 * 1024,
   });
+  if (result.ok) return;
+  const error = new Error(result.stderr?.trim() || result.error?.message || 'Recycle Bin operation failed');
+  error.code = result.error?.code === 'COMMAND_TIMEOUT' ? 'RECYCLE_BIN_TIMEOUT' : 'RECYCLE_BIN_FAILED';
+  throw error;
 }

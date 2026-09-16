@@ -4,11 +4,11 @@
   <img src="docs/spark_icon2.png" alt="SPARK — Symbiotic Personal AI Robotic Keeper" width="900">
 </p>
 
-> **Agent quick start:** 이 README의 `Installation` 절을 위에서 아래로 그대로 실행하면 새 Windows PC에서 SPARK 0.0.0 private-use baseline을 설치하고 ChatGPT custom MCP app까지 등록할 수 있습니다.
+> **Agent quick start:** 이 README의 `Installation` 절을 위에서 아래로 그대로 실행하면 새 Windows PC에서 SPARK 0.0.1 multi-user / deployment release candidate을 설치하고 ChatGPT custom MCP app까지 등록할 수 있습니다.
 
-SPARK는 **Symbiotic Personal AI Robotic Keeper**의 약자입니다. 현재 0.0.0은 ChatGPT를 OpenAI Secure MCP Tunnel로 Windows PC의 SPARK Transport에 연결하여 local filesystem CRUD와 simple command execution을 표준 MCP로 제공합니다. ChatGPT Windows app에는 CDP 기반 ChatGPT UI theme runtime이 함께 포함됩니다.
+SPARK는 **Symbiotic Personal AI Robotic Keeper**의 약자입니다. 현재 0.0.1은 ChatGPT를 OpenAI Secure MCP Tunnel로 Windows PC의 SPARK Transport에 연결하여 local filesystem CRUD와 simple command execution을 표준 MCP로 제공합니다. ChatGPT Windows app에는 CDP 기반 ChatGPT UI theme runtime이 함께 포함됩니다.
 
-현재 release는 **version 0.0.0 — Private Usage Baseline**입니다.
+현재 release는 **version 0.0.1 — Private Usage Baseline**입니다.
 
 ## 1. Architecture
 
@@ -79,7 +79,7 @@ error?
 
 ## 4. Installation
 
-이 절은 **새 Windows PC에서 SPARK 0.0.0을 처음 설치하는 순서**입니다. 위에서 아래로 그대로 진행합니다.
+이 절은 **새 Windows PC에서 SPARK 0.0.1을 처음 설치하는 순서**입니다. 위에서 아래로 그대로 진행합니다.
 
 ### Step 0 — Prerequisite
 
@@ -118,54 +118,57 @@ npm --version
 node -p "require('./package.json').version"
 ```
 
-마지막 출력은 `0.0.0`이어야 합니다.
+마지막 출력은 `0.0.1`이어야 합니다.
 
-### Step 3 — Private config 생성
+### Step 3 — Private config + SPARK Access Key 초기화
+
+신규 설치는 먼저 한 번 실행합니다.
 
 ```cmd
-mkdir .runtime\config 2>NUL
-copy modules\transport\config\spark.example.json .runtime\config\spark.local.json
+SPARK.cmd init
+```
+
+`init`은 기존 private config나 기존 access-key secret을 덮어쓰지 않습니다. Node.js `crypto.randomBytes(32)` / OS CSPRNG로 256-bit per-instance SPARK Access Key를 만들고 다음 두 위치에 분리 저장합니다.
+
+- raw `spk_...` key: `.runtime/secrets/spark-access-key.txt`
+- SHA-256 digest: `.runtime/config/spark.local.json`의 `transport.auth.bearerTokenSha256`
+
+config의 `transport.auth.accessKeyFile`은 기본적으로 `.runtime/secrets/spark-access-key.txt`를 가리킵니다. `.runtime/` 전체는 Git에서 제외됩니다. 시작 시 SPARK는 secret file의 실제 key를 다시 SHA-256하여 config digest와 일치하는지 확인하고, 일치하지 않거나 auth가 `bearer`가 아니면 **startup을 fail closed**합니다.
+
+```cmd
 notepad .runtime\config\spark.local.json
 ```
 
 최소 수정 항목:
 
 - `transport.allowedRoot`: SPARK가 접근할 local root
-- `tunnel.id`: Step 1에서 준비한 tunnel ID
-- `tunnel.controlPlaneApiKeyFile`: 기본값 `.runtime/secrets/control-plane-api-key.txt` 사용 권장
-- `chatgptUi.enabled`: ChatGPT UI/CDP 통합 사용 여부
-- `chatgptUi.theme`: 기본 `dark-red`
+- `transport.auth.mode`: **반드시 `bearer`** (`none` 금지)
+- `transport.auth.accessKeyFile`: 기본 `.runtime/secrets/spark-access-key.txt`
+- `tunnel.id`: 이 사용자/PC 전용 Tunnel ID
+- `tunnel.controlPlaneApiKeyFile`: 기본 `.runtime/secrets/control-plane-api-key.txt`
+- `chatgptUi.enabled`, `chatgptUi.theme`, `chatgptUi.progress.enabled`
 
 Windows JSON path는 `C:/SPARK/...`처럼 `/` 표기를 권장합니다.
 
-Root별 권한 예:
-
-```json
-"allowedRoot": [
-  { "path": "C:/SPARK/workspace", "permissions": "RWX" },
-  { "path": "C:/SPARK/reference", "permissions": "R" }
-]
-```
-
-- `R`: list/read/copy source
-- `W`: create/write/modify/copy destination/move/delete
-- `X`: `run_command` cwd
-
-Private config 선택 순서:
-
-1. 명시적인 `-ConfigPath`
-2. 실제 파일이 존재하는 `SPARK_CONFIG`
-3. `modules/transport/config/spark.local.json`
-4. `.runtime/config/spark.local.json`
-
-### Step 4 — Runtime API key 저장
+### Step 4 — Tunnel Runtime API key 저장
 
 ```cmd
 mkdir .runtime\secrets 2>NUL
 notepad .runtime\secrets\control-plane-api-key.txt
 ```
 
-파일에는 Step 1에서 만든 **Runtime API key 한 줄만** 저장합니다. `.runtime/`은 Git에 포함되지 않습니다.
+파일에는 Step 1에서 만든 **OpenAI Tunnel Runtime API key 한 줄만** 저장합니다. `.runtime/`은 Git에 포함되지 않습니다.
+
+### Step 4A — 0.0.1 instance identity / secret binding
+
+```text
+1 local SPARK instance
+= 1 tunnel_id
++ 1 OpenAI Tunnel Runtime API key (control-plane key)
++ 1 SPARK Access Key (spk_...)
+```
+
+`tunnel_id`가 workspace UI에 보이더라도 `spk_...` key가 일치하지 않으면 local MCP는 HTTP 401로 거부합니다. SPARK runtime identity state에는 raw secret이 아니라 tunnel ID, tunnel Runtime key SHA-256, SPARK Access Key SHA-256, tunnel profile SHA-256을 기록하여 기존 tunnel process 재사용 시 동일 조합인지 확인합니다. `auth:none`은 0.0.1 runtime에서 허용하지 않습니다.
 
 ### Step 5 — SPARK 시작
 
@@ -197,27 +200,31 @@ SPARK.cmd validate
 
 모든 명령이 PASS해야 합니다.
 
-### Step 7 — ChatGPT custom MCP app 등록
+### Step 7 — ChatGPT workspace App publish + 사용자별 Access Key Connect
 
-SPARK runtime과 tunnel이 healthy/ready인 상태에서 ChatGPT에 등록합니다.
+**중요: SPARK Access Key는 App 생성 화면에 입력하는 것이 아닙니다.** 현재 ChatGPT Business UI에서 검증된 순서는 아래와 같습니다.
 
-1. ChatGPT에서 developer mode를 활성화합니다.
-2. Apps → Create에서 새 custom MCP app을 만듭니다.
-3. 이름은 **`SPARK`**로 지정합니다.
-4. 필요하면 app logo로 `docs/spark_icon1.png`를 사용합니다. 이 파일은 256×256 PNG이며 10 KB 미만입니다.
-5. Connection은 **`Tunnel`**을 선택합니다.
-6. Step 1에서 만든 tunnel을 선택하거나 `tunnel_id`를 붙여넣습니다.
-   - private/local MCP URL을 ChatGPT에 직접 입력하지 않습니다.
-7. `Scan Tools`를 실행하고 완료될 때까지 기다립니다.
-8. Actions가 정확히 **10개**인지 확인합니다.
-9. Create 후 app을 활성화합니다.
+#### A. Workspace admin/developer — App 정의 및 Publish
 
-Business에서 이미 publish된 custom app은 현재 직접 이름/metadata를 수정할 수 없습니다. 기존 `SPARK_Transport`를 `SPARK`로 바꾸려면 새 `SPARK` app을 recreate/publish한 뒤 기존 app을 **disable**합니다. UI에서 remove/delete가 제공되는 경우에만 제거하고, 없으면 disabled 상태로 둡니다. 개발자 모드의 미게시 app은 Manage에서 이름과 logo를 수정할 수 있습니다.
+1. ChatGPT developer mode를 활성화합니다.
+2. Apps/Create에서 custom App을 만들고 이름을 **`SPARK`**로 지정합니다.
+3. Connection은 **Tunnel**을 선택하고 이 SPARK instance의 `tunnel_id`를 선택/입력합니다.
+4. Authentication은 **`Access token / API key`** 를 선택합니다.
+5. Header scheme은 **`Bearer`** 를 선택합니다.
+6. App을 Workspace에 **Publish**합니다.
 
-OpenAI 공식 안내:
+#### B. 각 사용자 — Plugins 화면에서 자기 `spk_...` key 입력
 
-- Developer mode / custom MCP apps: https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt
-- Secure MCP Tunnel permission troubleshooting: https://github.com/openai/tunnel-client/blob/master/docs/permissions.md
+1. 사용자 ChatGPT에서 **Plugins → SPARK**를 엽니다.
+2. **Connect**를 누릅니다.
+3. 표시되는 **`Enter access token or API key`** 입력칸에 그 사용자의 local SPARK instance에 대응하는 `spk_...` 값을 입력합니다.
+   - `Bearer ` 문자열은 붙이지 않습니다.
+4. **Connect SPARK**를 누릅니다.
+5. App detail에서 **Actions · 10**이 표시되는지 확인합니다.
+6. Configure actions에서 Refresh가 필요하면 연결 완료 후 Refresh합니다. 연결되지 않은 상태에서는 `This app must be connected to refresh its actions.`가 표시될 수 있습니다.
+7. 새 Chat에서 SPARK tool 10개가 discovery되는지 확인합니다.
+
+즉 Workspace App 정의는 공유될 수 있지만 **connection credential은 각 사용자가 Plugins → SPARK → Connect 단계에서 따로 입력**합니다. 다른 팀원이 같은 `tunnel_id`를 볼 수 있어도 local SPARK의 per-instance `spk_...`가 없으면 요청은 401이어야 합니다.
 
 #### Create / Scan Tools가 실패할 때
 
@@ -245,7 +252,7 @@ control_plane_poll.ok: true
 - `MCP SSE probe returned 404 from openai.org`: OpenAI `tunnel-client` issue #35에서 같은 증상이 보고됐습니다. 그중 Windows 재현 하나는 Runtime API key가 `401 Unauthorized`로 거부되어 **Control Plane poll이 한 번도 성공하지 않은 상태**가 원인이었고, key를 바로잡아 `control_plane_poll.ok=true`가 되자 이 증상은 사라졌습니다. 따라서 이 오류가 보이면 SPARK에 SSE endpoint를 임의로 추가하기 전에 Control Plane poll부터 확인합니다. https://github.com/openai/tunnel-client/issues/35
 - `MCP server/discover response was inconsistent from openai.org` / HTTP 424: OpenAI `tunnel-client` issue #63은 v0.0.14의 **embedded MCP stub**이 modern stateless `2026-07-28` discovery를 올바르게 처리하지 못한 별도 문제였습니다. OpenAI는 source `master`에서 이를 수정했지만 해당 issue 종료 시점의 published v0.0.14에는 fix가 포함되지 않았다고 명시했습니다. SPARK는 embedded stub이 아니라 자체 HTTP MCP server가 `2026-07-28` `server/discover`/`tools/list`/`tools/call`을 직접 구현하므로 같은 오류 문자열만으로 SPARK server bug라고 단정하지 않습니다. https://github.com/openai/tunnel-client/issues/63
 
-SPARK가 사용하는 현재 profile은 **no-auth local MCP + Secure MCP Tunnel**입니다. 별도의 local MCP OAuth를 요구하지 않습니다. 다만 ChatGPT app 자체가 인증/권한 prompt를 표시하는 경우에는 해당 인증을 완료한 뒤 `Scan Tools`를 다시 실행해야 합니다.
+SPARK가 사용하는 현재 profile은 **Bearer-protected local MCP + Secure MCP Tunnel**입니다. 별도의 local MCP OAuth를 요구하지 않습니다. 다만 ChatGPT app 자체가 인증/권한 prompt를 표시하는 경우에는 해당 인증을 완료한 뒤 `Scan Tools`를 다시 실행해야 합니다.
 
 #### `@SPARK`가 보이는데 tool을 사용할 수 없을 때
 
@@ -348,7 +355,7 @@ npm run chatgpt-ui:validate
 SPARK.cmd validate
 ```
 
-0.0.0 source는 GitHub Actions에서 Node 24 기준 Windows와 Ubuntu regression을 통과했습니다.
+0.0.1 release-candidate source는 GitHub Actions에서 Node 24 기준 Windows와 Ubuntu regression을 통과했습니다.
 
 ## 9. Current Repository Layout
 
@@ -375,7 +382,7 @@ SPARK/
 
 ## 10. Baseline
 
-- Version: **0.0.0**
+- Version: **0.0.1** (release candidate until final bearer-key E2E + CI gate)
 - Name: **SPARK — Symbiotic Personal AI Robotic Keeper**
 - Current Brain path: **ChatGPT → Secure MCP Tunnel → SPARK Transport**
 - Current Windows UI integration: **ChatGPT UI CDP theme runtime**

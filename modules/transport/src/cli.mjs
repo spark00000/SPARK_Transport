@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
 import { DEFAULT_LEDGER_STATUS_LIMIT } from './constants.mjs';
 import { createOperationLedger } from './ledger.mjs';
+import { terminateProcessTree } from './command-runner.mjs';
 import { createSparkServer, ensureStateDir } from './server.mjs';
 
 const SELF=fileURLToPath(import.meta.url);
@@ -40,7 +41,9 @@ async function start(){
   fs.closeSync(logFd);
   const deadline=Date.now()+5000;
   while(Date.now()<deadline){const info=await health(config,500);const pid=await readPid(state.pidFile);if(info&&pid){print({status:'started',pid,healthy:true,host:config.host,port:config.port});return;}await new Promise(r=>setTimeout(r,100));}
-  throw new Error(`SPARK did not become healthy; inspect ${state.logFile}`);
+  await terminateProcessTree(child.pid,child).catch(()=>{});
+  await fsp.rm(state.pidFile,{force:true}).catch(()=>{});
+  throw new Error(`SPARK did not become healthy within startup timeout; child cleanup attempted; inspect ${state.logFile}`);
 }
 
 async function status(){
@@ -63,7 +66,12 @@ async function stop(){
   process.kill(pid,'SIGTERM');
   const deadline=Date.now()+5000;
   while(Date.now()<deadline&&processExists(pid))await new Promise(r=>setTimeout(r,100));
-  if(processExists(pid))throw new Error(`PID ${pid} did not stop within timeout`);
+  if(processExists(pid)){
+    await terminateProcessTree(pid).catch(()=>{});
+    const forceDeadline=Date.now()+1000;
+    while(Date.now()<forceDeadline&&processExists(pid))await new Promise(r=>setTimeout(r,50));
+  }
+  if(processExists(pid))throw new Error(`PID ${pid} did not stop after bounded graceful + forced cleanup`);
   await fsp.rm(state.pidFile,{force:true}).catch(()=>{});
   print({status:'stopped',pid});
 }

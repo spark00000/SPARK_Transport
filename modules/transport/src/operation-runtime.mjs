@@ -9,6 +9,25 @@ const MUTATING_OPERATIONS = new Set([
   'run_command',
 ]);
 
+const SAFE_PRECONDITION_ERRORS = new Set([
+  'INVALID_ARGUMENTS',
+  'PATH_TRAVERSAL',
+  'ABSOLUTE_PATH_NOT_ALLOWED',
+  'OUTSIDE_ALLOWED_ROOT',
+  'ROOT_PERMISSION_DENIED',
+  'ROOT_DELETE_FORBIDDEN',
+  'ALREADY_EXISTS',
+  'NOT_FOUND',
+  'AMBIGUOUS_ROOT_PATH',
+  'SYMLINK_ESCAPE',
+  'SYMLINK_MUTATION_NOT_ALLOWED',
+  'ELEVATION_REQUIRED_OR_PERMISSION_DENIED',
+  'COMMAND_START_FAILED',
+]);
+
+const COMMAND_WATCHDOG_GRACE_MS = 5_000;
+const DEFAULT_LEDGER_WATCHDOG_MS = 5_000;
+
 function operationTarget(name, args = {}) {
   if (typeof args.path === 'string') return args.path;
   if (typeof args.source === 'string' && typeof args.destination === 'string') return `${args.source} -> ${args.destination}`;
@@ -34,19 +53,117 @@ function dataOnly(legacy) {
   return data;
 }
 
-export function createOperationRuntime({ toolRuntime, ledger }) {
+function watchdogMsFor(name, args, operationTimeoutMs, commandTimeoutMs) {
+  if (name !== 'run_command') return operationTimeoutMs;
+  const requested = Number.isSafeInteger(args?.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : commandTimeoutMs;
+  return requested + COMMAND_WATCHDOG_GRACE_MS;
+}
+
+function withWatchdog(promise, timeoutMs, timeoutValue) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(typeof timeoutValue === 'function' ? timeoutValue() : timeoutValue);
+    }, timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function stateMayHaveChanged(name, legacy) {
+  if (!MUTATING_OPERATIONS.has(name) || legacy.ok === true) return false;
+  const code = legacy.error?.code;
+  if (code === 'OPERATION_TIMEOUT' || code === 'COMMAND_TIMEOUT' || code === 'RECYCLE_BIN_TIMEOUT') return true;
+  if (name === 'run_command') return !SAFE_PRECONDITION_ERRORS.has(code);
+  return false;
+}
+
+export function createOperationRuntime({ toolRuntime, ledger, operationTimeoutMs = 30_000, commandTimeoutMs = 30_000, ledgerTimeoutMs = DEFAULT_LEDGER_WATCHDOG_MS }) {
+  let pendingUncertainMutation = null;
+  let activeOperation = null;
+  let lastOperation = null;
+
+  function activity() {
+    return {
+      active: activeOperation ? { ...activeOperation } : null,
+      pendingUncertainMutation: pendingUncertainMutation ? {
+        operationId: pendingUncertainMutation.operationId,
+        operation: pendingUncertainMutation.name,
+      } : null,
+      last: lastOperation ? { ...lastOperation } : null,
+    };
+  }
+
   async function call(name, args = {}) {
     const operationId = ledger.nextOperationId();
     const startedAt = Date.now();
+    const watchdogMs = watchdogMsFor(name, args, operationTimeoutMs, commandTimeoutMs);
+    activeOperation = {
+      operationId,
+      operation: name,
+      startedAt: new Date(startedAt).toISOString(),
+      startedAtMs: startedAt,
+      watchdogMs,
+      mutating: MUTATING_OPERATIONS.has(name),
+    };
     let legacy;
-    try {
-      legacy = await toolRuntime.call(name, args);
-    } catch {
-      legacy = { ok: false, error: { code: 'INTERNAL_ERROR', message: 'the operation failed' } };
+    if (MUTATING_OPERATIONS.has(name) && pendingUncertainMutation) {
+      legacy = {
+        ok: false,
+        stateUncertain: true,
+        pendingOperationId: pendingUncertainMutation.operationId,
+        error: {
+          code: 'UNCERTAIN_MUTATION_IN_FLIGHT',
+          message: `prior timed-out mutation ${pendingUncertainMutation.operationId} has not settled; reconcile state before another mutation`,
+        },
+      };
+    } else {
+      const toolPromise = Promise.resolve().then(() => toolRuntime.call(name, args));
+      let toolSettled = false;
+      void toolPromise.finally(() => {
+        toolSettled = true;
+        if (pendingUncertainMutation?.promise === toolPromise) pendingUncertainMutation = null;
+      }).catch(() => {});
+      try {
+        legacy = await withWatchdog(
+          toolPromise,
+          watchdogMs,
+          () => ({
+            ok: false,
+            stateUncertain: MUTATING_OPERATIONS.has(name),
+            error: {
+              code: 'OPERATION_TIMEOUT',
+              message: `operation exceeded ${watchdogMs} ms watchdog`,
+            },
+          }),
+        );
+        if (legacy.error?.code === 'OPERATION_TIMEOUT' && MUTATING_OPERATIONS.has(name) && !toolSettled) {
+          pendingUncertainMutation = { operationId, name, promise: toolPromise };
+          legacy.pendingOperationId = operationId;
+        }
+      } catch {
+        legacy = { ok: false, error: { code: 'INTERNAL_ERROR', message: 'the operation failed' } };
+      }
     }
 
     const durationMs = Number.isFinite(legacy.durationMs) ? legacy.durationMs : Date.now() - startedAt;
     const changed = legacy.ok === true && MUTATING_OPERATIONS.has(name);
+    const stateUncertain = Boolean(legacy.stateUncertain || stateMayHaveChanged(name, legacy));
+    if (stateUncertain) legacy.stateUncertain = true;
     const error = legacy.ok === true ? undefined : {
       code: legacy.error?.code ?? 'INTERNAL_ERROR',
       message: legacy.error?.message ?? 'the operation failed',
@@ -63,11 +180,11 @@ export function createOperationRuntime({ toolRuntime, ledger }) {
       data: dataOnly(legacy),
       durationMs,
       requiresElevation,
-      retryable: error?.code === 'COMMAND_TIMEOUT',
+      retryable: !stateUncertain && (error?.code === 'COMMAND_TIMEOUT' || error?.code === 'OPERATION_TIMEOUT'),
       ...(error ? { error } : {}),
     };
 
-    await ledger.record({
+    const ledgerEntry = {
       operationId,
       operation: name,
       target: operationTarget(name, args),
@@ -76,9 +193,26 @@ export function createOperationRuntime({ toolRuntime, ledger }) {
       durationMs,
       errorCode: error?.code ?? null,
       summary,
-    });
+    };
+    try {
+      const ledgerOutcome = await withWatchdog(ledger.record(ledgerEntry), ledgerTimeoutMs, Symbol.for('SPARK_LEDGER_TIMEOUT'));
+      if (ledgerOutcome === Symbol.for('SPARK_LEDGER_TIMEOUT')) result.data.ledgerWarning = 'operation ledger write exceeded watchdog';
+    } catch {
+      result.data.ledgerWarning = 'operation ledger write failed';
+    }
+    lastOperation = {
+      operationId,
+      operation: name,
+      status: result.ok ? 'success' : 'failed',
+      startedAt: new Date(startedAt).toISOString(),
+      finishedAt: new Date().toISOString(),
+      durationMs,
+      stateUncertain,
+      errorCode: error?.code ?? null,
+    };
+    if (activeOperation?.operationId === operationId) activeOperation = null;
     return result;
   }
 
-  return { call };
+  return { call, activity };
 }

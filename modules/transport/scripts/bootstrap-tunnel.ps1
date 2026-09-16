@@ -11,10 +11,10 @@ $base = "https://github.com/openai/tunnel-client/releases/download/$tag"
 $zip = Join-Path $env:TEMP $name
 $sums = Join-Path $env:TEMP "SPARK-SHA256SUMS-$Version.txt"
 Write-Host "[S2-TUN-02] Downloading full OpenAI tunnel-client: $name"
-& curl.exe -fL "$base/$name" -o $zip
-if ($LASTEXITCODE -ne 0) { throw "tunnel-client download failed" }
-& curl.exe -fL "$base/SHA256SUMS.txt" -o $sums
-if ($LASTEXITCODE -ne 0) { throw "SHA256SUMS download failed" }
+& curl.exe -fL --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 2 "$base/$name" -o $zip
+if ($LASTEXITCODE -ne 0) { throw "tunnel-client download failed or exceeded 120 second watchdog" }
+& curl.exe -fL --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 2 "$base/SHA256SUMS.txt" -o $sums
+if ($LASTEXITCODE -ne 0) { throw "SHA256SUMS download failed or exceeded 60 second watchdog" }
 $line = Get-Content $sums | Where-Object { $_ -match [regex]::Escape($name) } | Select-Object -First 1
 if (-not $line) { throw "checksum entry not found for $name" }
 $expected = ($line -split '\s+')[0].ToLowerInvariant()
