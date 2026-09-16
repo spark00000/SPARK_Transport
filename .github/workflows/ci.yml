@@ -39,7 +39,6 @@ jobs:
           from pathlib import Path
           p=Path('modules/transport/test/multi-root.test.mjs')
           s=p.read_text(encoding='utf-8')
-          digest="'a'.repeat(64)"
           old="await fs.writeFile(configPath, JSON.stringify({ transport: { allowedRoot: [f.root, second] } }), 'utf8');"
           new="await fs.writeFile(configPath, JSON.stringify({ transport: { allowedRoot: [f.root, second], auth: { mode: 'bearer', bearerTokenSha256: 'a'.repeat(64) } } }), 'utf8');"
           if s.count(old)!=1: raise SystemExit('array fixture not found')
@@ -65,7 +64,7 @@ jobs:
         run: git diff --check
       - name: Commit hardened source and restore normal CI
         run: |
-          git show recovery/pre-0.0.1-auth-hardening-20260916:.github/workflows/ci.yml > .github/workflows/ci.yml
+          git show origin/recovery/pre-0.0.1-auth-hardening-20260916:.github/workflows/ci.yml > .github/workflows/ci.yml
           rm .github/auth_hardening_patch.py
           git config user.name noname
           git config user.email 118284176+spark000000@users.noreply.github.com
